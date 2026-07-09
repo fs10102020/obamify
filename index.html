@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html>
+<html lang="en" style="color-scheme: dark;">
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 
 <!-- Disable zooming: -->
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 
 <head>
     <title>obamify</title>
@@ -113,7 +113,7 @@
             transform: translate(-50%, -50%);
             color: #f0f0f0;
             font-size: 24px;
-            font-family: Ubuntu-Light, Helvetica, sans-serif;
+            font-family: Helvetica, Arial, sans-serif;
             text-align: center;
         }
 
@@ -165,11 +165,18 @@
             }
         }
 
+        @media (prefers-reduced-motion: reduce) {
+            .lds-dual-ring:after {
+                animation: none;
+                border-color: #888 transparent #888 transparent;
+            }
+        }
+
         /* Bottom-left corner icons */
         .bottom-left-icons {
             position: fixed;
-            bottom: 20px;
-            left: 20px;
+            bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+            left: calc(20px + env(safe-area-inset-left, 0px));
             display: flex;
             flex-direction: column;
             gap: 12px;
@@ -183,16 +190,16 @@
             justify-content: center;
             width: 48px;
             height: 48px;
-            background-color: rgba(0, 0, 0, 1.0);
+            background-color: #0d0f10;
             border-radius: 8px;
-            transition: all 0.2s ease;
+            transition: transform 0.2s ease, background-color 0.2s ease;
             text-decoration: none;
             overflow: visible;
         }
 
         .icon-link:hover {
             transform: scale(1.1);
-            background-color: rgba(0, 0, 0, 1.0);
+            background-color: #1a1f20;
         }
 
         .icon-link img {
@@ -205,7 +212,7 @@
             position: absolute;
             left: 100%;
             bottom: 0;
-            background-color: rgba(0, 0, 0, 0.9);
+            background-color: rgba(13, 15, 16, 0.9);
             color: white;
             padding: 8px 8px;
             padding-left: 8px;
@@ -216,7 +223,7 @@
             margin-left: 0px;
             opacity: 0;
             transform: translateX(-10px);
-            transition: all 0.3s ease;
+            transition: opacity 0.3s ease, transform 0.3s ease, padding-left 0.3s ease;
             pointer-events: none;
             z-index: 10;
         }
@@ -231,6 +238,11 @@
             border-radius: 12px 12px 0 12px;
         }
 
+        .icon-link:focus-visible {
+            outline: 2px solid #73c7d3;
+            outline-offset: 2px;
+        }
+
         .error {
             padding-top: 10px;
             font-size: small;
@@ -242,26 +254,28 @@
 <body>
     <!-- The WASM code will resize the canvas dynamically -->
     <!-- the id is hardcoded in main.rs . so, make sure both match. -->
-    <canvas id="the_canvas_id"></canvas>
+    <main>
+        <canvas id="the_canvas_id" aria-label="obamify image transformation canvas"></canvas>
+    </main>
 
     <!-- the loading spinner will be removed in main.rs -->
     <div class="centered" id="loading_text">
-        <noscript>You need javascript to use this website</noscript>
+        <noscript>You need JavaScript to use this website</noscript>
         <p style="font-size:16px">
             Loading…
         </p>
-        <div class="lds-dual-ring"></div>
+        <div class="lds-dual-ring" aria-hidden="true"></div>
     </div>
 
     <!-- Bottom-left corner icons -->
     <div class="bottom-left-icons">
-        <a href="https://github.com/Spu7Nix/obamify" class="icon-link" target="_blank" rel="noopener noreferrer">
+        <a href="https://github.com/Spu7Nix/obamify" class="icon-link" target="_blank" rel="noopener noreferrer" aria-label="obamify source code on GitHub (opens in new tab)">
             <img src="assets/github-mark-white.svg" alt="source code" />
             <span class="icon-text">source code</span>
         </a>
-        <a href="https://spu7nix.net" class="icon-link" target="_blank" rel="noopener noreferrer">
+        <a href="https://spu7nix.net" class="icon-link" target="_blank" rel="noopener noreferrer" aria-label="Spu7Nix website (opens in new tab)">
             <img src="assets/pfp_transparent.png" alt="Spu7Nix" />
-            <span class="icon-text">my website</span>
+            <span class="icon-text">website</span>
         </a>
     </div>
     <!--Register Service Worker. this will cache the wasm / js scripts for offline use (for PWA functionality). -->
@@ -321,7 +335,7 @@
             shareButton.textContent = 'save/share';
             shareButton.style.cssText = `
                 padding: 12px 24px;
-                background-color: #007bff;
+                background-color: #2f5b63;
                 color: white;
                 border: none;
                 border-radius: 5px;
@@ -356,7 +370,7 @@
                     if (error.name !== 'AbortError') {
                         console.error('Error sharing:', error);
                         // Fall back to showing the download link
-                        alert('Could not share file: ' + error.message + '\nTry using the download link instead.');
+                        console.error('Could not share file:', error.message);
                     } else {
                         console.log('Share cancelled by user');
                     }

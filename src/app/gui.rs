@@ -1,4 +1,3 @@
-#[cfg(not(target_arch = "wasm32"))]
 use super::DRAWING_ALPHA;
 
 use super::GuiMode;
@@ -37,17 +36,28 @@ struct GuiImageCache {
     overlap_preview: Option<egui::TextureHandle>,
 }
 
+#[derive(Clone, Copy)]
+enum ImagePromptAction {
+    NewPreset,
+    ChangeSource,
+    ChangeTarget,
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) struct PendingImageResult {
+    action: ImagePromptAction,
+    result: Result<(String, SourceImg), String>,
+}
+
 pub(crate) struct GuiState {
-    #[cfg(not(target_arch = "wasm32"))]
     pub last_mouse_pos: Option<(f32, f32)>,
-    #[cfg(not(target_arch = "wasm32"))]
     pub drawing_color: [f32; 4],
     mode: GuiMode,
     pub animate: bool,
     //pub fps_text: String,
     show_progress_modal: Option<Uuid>,
     last_progress: f32,
-    process_cancelled: Arc<AtomicBool>,
+    process_cancelled: Option<Arc<AtomicBool>>,
     //pub currently_processing: Option<Preset>,
     pub presets: Vec<Preset>,
     //pub current_settings: GenerationSettings,
@@ -72,10 +82,8 @@ impl GuiState {
             mode: GuiMode::Transform,
             show_progress_modal: None,
             last_progress: 0.0,
-            process_cancelled: Arc::new(AtomicBool::new(false)),
-            #[cfg(not(target_arch = "wasm32"))]
+            process_cancelled: None,
             last_mouse_pos: None,
-            #[cfg(not(target_arch = "wasm32"))]
             drawing_color: [0.0, 0.0, 0.0, DRAWING_ALPHA],
             //currently_processing: None,
             //current_settings: GenerationSettings::default(),
@@ -95,6 +103,7 @@ impl GuiState {
 
     fn hide_progress_modal(&mut self) {
         self.show_progress_modal = None;
+        self.process_cancelled = None;
         #[cfg(target_arch = "wasm32")]
         show_icons();
     }
@@ -167,6 +176,11 @@ impl App for ObamifyApp {
 
         #[cfg(target_arch = "wasm32")]
         self.ensure_worker(ctx);
+
+        #[cfg(target_arch = "wasm32")]
+        self.apply_pending_image_results();
+
+        self.gif_recorder.apply_pending_status();
 
         // Run GPU pipeline
         if let Some(img) = &self.preview_image {
@@ -247,8 +261,6 @@ impl App for ObamifyApp {
                 } else {
                     self.sim.update(&mut self.seeds, self.size.0);
                 }
-                rs.queue
-                    .write_buffer(&self.seed_buf, 0, bytemuck::cast_slice(&self.seeds));
                 // Update seed texture for WebGL compatibility
                 self.update_seed_texture_data(&rs.queue, &self.seeds);
             }
@@ -267,293 +279,308 @@ impl App for ObamifyApp {
         let mobile_layout = screen_width < 750.0;
 
         let baseline_zoom = if is_landscape { 1.4_f32 } else { 1.0_f32 };
+        apply_studio_style(ctx);
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.ctx().set_zoom_factor(baseline_zoom);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), 0.0),
-                if !mobile_layout {
-                    egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true)
-                } else {
-                    egui::Layout::top_down(egui::Align::Min)
-                },
-                |ui| {
-                    match self.gui.mode {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        GuiMode::Draw => {
-                            if ui.button("reset").clicked() {
-                                self.init_canvas(device, &rs.queue);
-                            }
+        let toolbar_frame = egui::Frame::new()
+            .fill(Color32::from_rgb(13, 15, 16))
+            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(33, 39, 41)))
+            .inner_margin(egui::Margin::symmetric(12, 10));
 
-                            while let Some(msg) = self.get_latest_msg() {
-                                match msg {
-                                    ProgressMsg::UpdatePreview {
-                                        width,
-                                        height,
-                                        data,
-                                    } => {
-                                        let image =
-                                            image::ImageBuffer::from_vec(width, height, data);
-                                        self.preview_image = image;
-                                    }
-                                    ProgressMsg::Cancelled => {
-                                        self.gui.process_cancelled.store(false, Ordering::Relaxed);
-                                        self.preview_image = None;
-
-                                        ui.close();
-                                    }
-                                    ProgressMsg::UpdateAssignments(assignments) => {
-                                        self.sim.set_assignments(assignments, self.size.0)
-                                    }
-                                    ProgressMsg::Progress(_) => todo!(),
-                                    ProgressMsg::Done(_) => todo!(),
-                                    ProgressMsg::Error(_) => todo!(),
+        egui::TopBottomPanel::top("top")
+            .frame(toolbar_frame)
+            .show(ctx, |ui| {
+                ui.ctx().set_zoom_factor(baseline_zoom);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 0.0),
+                    if !mobile_layout {
+                        egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true)
+                    } else {
+                        egui::Layout::top_down(egui::Align::Min)
+                    },
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new("obamify")
+                                .strong()
+                                .color(Color32::from_rgb(229, 238, 239)),
+                        );
+                        ui.separator();
+                        match self.gui.mode {
+                            GuiMode::Draw => {
+                                if ui.button("Reset").clicked() {
+                                    self.init_canvas(device, &rs.queue);
                                 }
-                            }
 
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new("🏠")))
-                                .on_hover_text("transform mode")
-                                .clicked()
-                            {
-                                self.gui.mode = GuiMode::Transform;
-                                self.change_sim(device, &rs.queue, self.gui.presets[0].clone(), 0);
-                            }
-                        }
-
-                        GuiMode::Transform => {
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.add(egui::Button::new("play transformation")).clicked() {
-                                    self.gui.animate = true;
-                                    self.sim.prepare_play(&mut self.seeds, self.reverse);
-                                }
-                                if ui
-                                    .add(egui::Checkbox::new(&mut self.reverse, "reverse"))
-                                    .changed()
-                                {
-                                    self.gui.animate = true;
-                                    self.reset_sim(device, &rs.queue);
-                                }
-                                // if ui.button("reload").clicked() {
-                                //     self.reset_sim(device, &rs.queue);
-                                //     self.gui.animate = false;
-                                // }
-                            });
-                            ui.separator();
-
-                            if ui
-                                .button(if self.reverse {
-                                    "save reverse gif"
-                                } else {
-                                    "save gif"
-                                })
-                                .clicked()
-                            {
-                                self.gif_recorder.status = GifStatus::Recording;
-                                self.gif_recorder.encoder = None;
-                                if let Err(err) = self
-                                    .gif_recorder
-                                    .init_encoder(self.colors.read().unwrap().as_ref())
-                                {
-                                    self.gif_recorder.status = GifStatus::Error(err.to_string());
-                                } else {
-                                    self.resize_textures(
-                                        device,
-                                        (GIF_RESOLUTION, GIF_RESOLUTION),
-                                        false,
-                                    );
-                                    self.reset_sim(device, &rs.queue);
-                                    self.gui.animate = true;
-                                    for _ in 0..20 {
-                                        self.sim.update(&mut self.seeds, self.size.0);
-                                    }
-                                }
-                            }
-
-                            ui.separator();
-                            // choose preset
-                            // for (i, preset) in self.gui.presets.clone().into_iter().enumerate() {
-                            //     if ui.button(i.to_string()).clicked() {
-                            //         self.change_sim(device, preset);
-                            //         self.gui.animate = false;
-                            //     }
-                            // }
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("choose preset:");
-                                egui::ComboBox::from_label("")
-                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                                    .selected_text({
-                                        let name = self.sim.name();
-                                        if name.chars().count() > 13 {
-                                            let truncated: String = name.chars().take(10).collect();
-                                            format!("{truncated}…")
-                                        } else {
-                                            name.clone()
+                                while let Some(msg) = self.get_latest_msg() {
+                                    match msg {
+                                        ProgressMsg::UpdatePreview {
+                                            width,
+                                            height,
+                                            data,
+                                        } => {
+                                            let image =
+                                                image::ImageBuffer::from_vec(width, height, data);
+                                            self.preview_image = image;
                                         }
+                                        ProgressMsg::Cancelled => {
+                                            self.gui.process_cancelled = None;
+                                            self.preview_image = None;
+
+                                            ui.close();
+                                        }
+                                        ProgressMsg::UpdateAssignments(assignments) => {
+                                            self.sim.set_assignments(assignments, self.size.0)
+                                        }
+                                        ProgressMsg::Progress(_) => {}
+                                        ProgressMsg::Done(_) => {}
+                                        ProgressMsg::Error(_) => {}
+                                    }
+                                }
+
+                                if ui
+                                    .add(egui::Button::new("Transform"))
+                                    .on_hover_text("transform mode")
+                                    .clicked()
+                                {
+                                    self.gui.mode = GuiMode::Transform;
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    self.current_drawing_id
+                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    self.change_sim(
+                                        device,
+                                        &rs.queue,
+                                        self.gui.presets[0].clone(),
+                                        0,
+                                    );
+                                }
+                            }
+
+                            GuiMode::Transform => {
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.add(egui::Button::new("Play")).clicked() {
+                                        self.gui.animate = true;
+                                        self.sim.prepare_play(&mut self.seeds, self.reverse);
+                                    }
+                                    if ui
+                                        .add(egui::Checkbox::new(&mut self.reverse, "reverse"))
+                                        .changed()
+                                    {
+                                        self.gui.animate = true;
+                                        self.reset_sim(device, &rs.queue);
+                                    }
+                                    // if ui.button("reload").clicked() {
+                                    //     self.reset_sim(device, &rs.queue);
+                                    //     self.gui.animate = false;
+                                    // }
+                                });
+                                ui.separator();
+
+                                if ui
+                                    .button(if self.reverse {
+                                        "Save GIF (reversed)"
+                                    } else {
+                                        "Save GIF"
                                     })
-                                    .show_ui(ui, |ui| {
-                                        let mut to_remove: Option<usize> = None;
-                                        let mut close_menu = false;
+                                    .clicked()
+                                {
+                                    self.gif_recorder.status = GifStatus::Recording;
+                                    self.gif_recorder.encoder = None;
+                                    if let Err(err) = self.gif_recorder.init_encoder(
+                                        self.colors
+                                            .read()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .as_ref(),
+                                    ) {
+                                        self.gif_recorder.status =
+                                            GifStatus::Error(err.to_string());
+                                    } else {
+                                        self.resize_textures(
+                                            device,
+                                            (GIF_RESOLUTION, GIF_RESOLUTION),
+                                        );
+                                        self.reset_sim(device, &rs.queue);
+                                        self.gui.animate = true;
+                                        for _ in 0..20 {
+                                            self.sim.update(&mut self.seeds, self.size.0);
+                                        }
+                                    }
+                                }
 
-                                        for (i, preset) in
-                                            self.gui.presets.clone().into_iter().enumerate()
-                                        {
-                                            ui.horizontal(|ui| {
-                                                let remove_enabled = self.gui.presets.len() > 5;
+                                ui.separator();
+                                // choose preset
+                                // for (i, preset) in self.gui.presets.clone().into_iter().enumerate() {
+                                //     if ui.button(i.to_string()).clicked() {
+                                //         self.change_sim(device, preset);
+                                //         self.gui.animate = false;
+                                //     }
+                                // }
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Preset");
+                                    egui::ComboBox::from_label("")
+                                        .close_behavior(
+                                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                                        )
+                                        .selected_text({
+                                            let name = self.sim.name();
+                                            if name.chars().count() > 13 {
+                                                let truncated: String =
+                                                    name.chars().take(10).collect();
+                                                format!("{truncated}…")
+                                            } else {
+                                                name.to_string()
+                                            }
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            let mut to_remove: Option<usize> = None;
+                                            let mut close_menu = false;
 
-                                                // Calculate width for delete button (so preset button can fill the rest)
-                                                let del_width = if remove_enabled {
-                                                    let txt = egui::WidgetText::from("x");
-                                                    let galley = txt.into_galley(
-                                                        ui,
-                                                        None,
-                                                        f32::INFINITY,
-                                                        egui::TextStyle::Button,
-                                                    );
-                                                    galley.size().x
-                                                        + ui.spacing().button_padding.x * 2.0
-                                                } else {
-                                                    0.0
-                                                };
-                                                let spacing = if remove_enabled {
-                                                    ui.spacing().item_spacing.x
-                                                } else {
-                                                    0.0
-                                                };
+                                            let n_presets = self.gui.presets.len();
+                                            for i in 0..n_presets {
+                                                ui.horizontal(|ui| {
+                                                    let remove_enabled = self.gui.presets.len() > 5;
 
-                                                let preset_width =
-                                                    (ui.available_width() - del_width - spacing)
+                                                    // Calculate width for delete button (so preset button can fill the rest)
+                                                    let del_width = if remove_enabled {
+                                                        let txt = egui::WidgetText::from("x");
+                                                        let galley = txt.into_galley(
+                                                            ui,
+                                                            None,
+                                                            f32::INFINITY,
+                                                            egui::TextStyle::Button,
+                                                        );
+                                                        galley.size().x
+                                                            + ui.spacing().button_padding.x * 2.0
+                                                    } else {
+                                                        0.0
+                                                    };
+                                                    let spacing = if remove_enabled {
+                                                        ui.spacing().item_spacing.x
+                                                    } else {
+                                                        0.0
+                                                    };
+
+                                                    let preset_width = (ui.available_width()
+                                                        - del_width
+                                                        - spacing)
                                                         .max(0.0);
 
-                                                let selected = i == self.gui.current_preset;
-                                                let preset_resp = ui.add_sized(
-                                                    [preset_width, ui.spacing().interact_size.y],
-                                                    egui::Button::selectable(
-                                                        selected,
-                                                        &preset.inner.name,
-                                                    ),
-                                                );
+                                                    let selected = i == self.gui.current_preset;
+                                                    let preset_resp = ui.add_sized(
+                                                        [
+                                                            preset_width,
+                                                            ui.spacing().interact_size.y,
+                                                        ],
+                                                        egui::Button::selectable(
+                                                            selected,
+                                                            &self.gui.presets[i].inner.name,
+                                                        ),
+                                                    );
 
-                                                if remove_enabled
-                                                    && ui
-                                                        .small_button("x")
-                                                        .on_hover_text("delete preset")
-                                                        .clicked()
-                                                {
-                                                    to_remove = Some(i);
-                                                } else if preset_resp.clicked() {
+                                                    if remove_enabled
+                                                        && ui
+                                                            .small_button("x")
+                                                            .on_hover_text("delete preset")
+                                                            .clicked()
+                                                    {
+                                                        to_remove = Some(i);
+                                                    } else if preset_resp.clicked() {
+                                                        self.change_sim(
+                                                            device,
+                                                            &rs.queue,
+                                                            self.gui.presets[i].clone(),
+                                                            i,
+                                                        );
+                                                        self.gui.animate = true;
+                                                        self.gui.current_preset = i;
+                                                        close_menu = true;
+                                                    }
+                                                });
+                                            }
+
+                                            if let Some(idx) = to_remove {
+                                                let removed_current =
+                                                    idx == self.gui.current_preset;
+                                                self.gui.presets.remove(idx);
+                                                if removed_current {
+                                                    let new_index =
+                                                        idx.min(self.gui.presets.len() - 1);
                                                     self.change_sim(
                                                         device,
                                                         &rs.queue,
-                                                        preset.clone(),
-                                                        i,
+                                                        self.gui.presets[new_index].clone(),
+                                                        new_index,
                                                     );
-                                                    self.gui.animate = true;
-                                                    self.gui.current_preset = i;
-                                                    close_menu = true;
+                                                    self.gui.current_preset = new_index;
+                                                } else if idx < self.gui.current_preset {
+                                                    self.gui.current_preset -= 1;
                                                 }
-                                            });
-                                        }
-
-                                        if let Some(idx) = to_remove {
-                                            let removed_current = idx == self.gui.current_preset;
-                                            self.gui.presets.remove(idx);
-                                            if removed_current {
-                                                let new_index = idx.min(self.gui.presets.len() - 1);
-                                                self.change_sim(
-                                                    device,
-                                                    &rs.queue,
-                                                    self.gui.presets[new_index].clone(),
-                                                    new_index,
-                                                );
-                                                self.gui.current_preset = new_index;
-                                            } else if idx < self.gui.current_preset {
-                                                self.gui.current_preset -= 1;
                                             }
-                                        }
 
-                                        if close_menu {
-                                            ui.close();
-                                        }
-                                    });
+                                            if close_menu {
+                                                ui.close();
+                                            }
+                                        });
 
-                                // Make button glow if user hasn't obamified once
-                                let button_response = if !self.gui.has_obamified_once {
-                                    // Create a glowing effect by animating the button outline
-                                    let time = ui.input(|i| i.time);
-                                    let pulse = ((time * 2.0).sin() * 0.5 + 0.5) as f32;
-                                    let glow_color = egui::Color32::from_rgb(
-                                        (30.0 + pulse * 100.0) as u8,
-                                        (120.0 + pulse * 135.0) as u8,
-                                        (200.0 + pulse * 55.0) as u8,
-                                    );
-
-                                    let button = egui::Button::new("obamify new image")
-                                        .stroke(egui::Stroke::new(1.0, glow_color));
-                                    ui.add(button)
-                                } else {
-                                    ui.button("obamify new image")
-                                };
-
-                                if button_response.clicked() {
-                                    // open file select
-                                    if let Some((ref img, ref settings)) = self.gui.saved_config {
-                                        self.gui.configuring_generation = Some((
-                                            img.clone(),
-                                            settings.clone_with_new_id(),
-                                            GuiImageCache::default(),
-                                        ));
-                                        #[cfg(target_arch = "wasm32")]
-                                        hide_icons();
-                                    } else {
-                                        prompt_image(
-                                            "choose image to obamify",
-                                            self,
-                                            |name: String, mut img: SourceImg, app: &mut ObamifyApp| {
-                                                img = ensure_reasonable_size(img);
-                                                app.gui.configuring_generation = Some((
-                                                    img,
-                                                    GenerationSettings::default(Uuid::new_v4(), name),
-                                                    GuiImageCache::default(),
-                                                ));
-                                                #[cfg(target_arch = "wasm32")]
-                                                hide_icons();
-                                            },
+                                    // Make button glow if user hasn't obamified once
+                                    let button_response = if !self.gui.has_obamified_once {
+                                        // Create a glowing effect by animating the button outline
+                                        let time = ui.input(|i| i.time);
+                                        let pulse = ((time * 2.0).sin() * 0.5 + 0.5) as f32;
+                                        let glow_color = egui::Color32::from_rgb(
+                                            (30.0 + pulse * 100.0) as u8,
+                                            (120.0 + pulse * 135.0) as u8,
+                                            (200.0 + pulse * 55.0) as u8,
                                         );
-                                    }
-                                }
-                            });
-                            ui.separator();
 
-                            if ui
-                                .add(egui::Button::new(egui::RichText::new("✏")))
-                                .on_hover_text("drawing mode")
-                                .clicked()
-                            {
-                                #[cfg(not(target_arch = "wasm32"))]
+                                        let button = egui::Button::new("New image")
+                                            .stroke(egui::Stroke::new(1.0, glow_color));
+                                        ui.add(button)
+                                    } else {
+                                        ui.button("New image")
+                                    };
+
+                                    if button_response.clicked() {
+                                        // open file select
+                                        if let Some((ref img, ref settings)) = self.gui.saved_config
+                                        {
+                                            self.gui.configuring_generation = Some((
+                                                img.clone(),
+                                                settings.clone_with_new_id(),
+                                                GuiImageCache::default(),
+                                            ));
+                                            #[cfg(target_arch = "wasm32")]
+                                            hide_icons();
+                                        } else {
+                                            prompt_image(
+                                                "choose image to obamify",
+                                                self,
+                                                ImagePromptAction::NewPreset,
+                                            );
+                                        }
+                                    }
+                                });
+                                ui.separator();
+
+                                if ui
+                                    .add(egui::Button::new("Draw"))
+                                    .on_hover_text("drawing mode")
+                                    .clicked()
                                 {
                                     self.gui.mode = GuiMode::Draw;
                                     self.init_canvas(device, &rs.queue);
                                 }
-
-                                #[cfg(target_arch = "wasm32")]
-                                {
-                                    web_sys::window()
-                                        .unwrap()
-                                        .alert_with_message(
-                                            "drawing mode not available on the web version :(",
-                                        )
-                                        .ok();
-                                }
                             }
                         }
-                    }
-                },
-            );
-        });
+                    },
+                );
+            });
         if self.gui.configuring_generation.is_some() {
-            Window::new("obamification settings")
-                .max_width(screen_width.min(400.0) * 0.8)
+            let settings_width = if mobile_layout {
+                screen_width * 0.94
+            } else {
+                screen_width.min(900.0) * 0.9
+            };
+            Window::new("Create preset")
+                .max_width(settings_width)
                 //.max_height(500.0)
                 .resizable(false)
                 .collapsible(false)
@@ -624,11 +651,10 @@ impl App for ObamifyApp {
                                                     0.5,
                                                 );
 
-                                                ui.add(
-                                                    egui::Image::new(egui::include_image!(
-                                                        "./arrow-right.svg"
-                                                    ))
-                                                    .max_size(egui::vec2(50.0, 50.0)),
+                                                ui.label(
+                                                    egui::RichText::new("→")
+                                                        .size(36.0)
+                                                        .color(Color32::from_rgb(128, 128, 128)),
                                                 );
                                             });
                                         }
@@ -648,39 +674,25 @@ impl App for ObamifyApp {
                                 prompt_image(
                                     "choose image to obamify",
                                     self,
-                                    |_, mut img: SourceImg, app: &mut ObamifyApp| {
-                                        img = ensure_reasonable_size(img);
-                                        if let Some((src, _, cache)) =
-                                            &mut app.gui.configuring_generation
-                                        {
-                                            *src = img;
-                                            cache.source_preview = None;
-                                        }
-                                    },
+                                    ImagePromptAction::ChangeSource,
                                 );
                             } else if change_target {
                                 prompt_image(
                                     "choose custom target image",
                                     self,
-                                    |_, mut img: SourceImg, app: &mut ObamifyApp| {
-                                        img = ensure_reasonable_size(img);
-                                        if let Some((_, settings, cache)) =
-                                            &mut app.gui.configuring_generation
-                                        {
-                                            settings.set_raw_target(img);
-                                            cache.target_preview = None;
-                                        }
-                                    },
+                                    ImagePromptAction::ChangeTarget,
                                 );
                             }
-
-                            ui.separator();
 
                             if let Some((_img, settings, _)) =
                                 self.gui.configuring_generation.as_mut()
                             {
-                                egui::CollapsingHeader::new("advanced settings")
-                                    .default_open(false)
+                                ui.separator();
+                                algorithm_picker_ui(ui, settings);
+
+                                ui.separator();
+                                egui::CollapsingHeader::new("Output controls")
+                                    .default_open(true)
                                     .show(ui, |ui| {
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(max_w, 0.0),
@@ -691,7 +703,7 @@ impl App for ObamifyApp {
                                                     [slider_w, 20.0],
                                                     egui::Slider::new(
                                                         &mut settings.sidelen,
-                                                        64..=256,
+                                                        32..=256,
                                                     )
                                                     .text("resolution"),
                                                 );
@@ -704,40 +716,27 @@ impl App for ObamifyApp {
                                                         0..=50,
                                                     )
                                                     .text("proximity importance"),
+                                                )
+                                                .on_hover_text(
+                                                    "Higher values keep pixels closer to their original positions",
                                                 );
-
-                                                let mut algorithm = match settings.algorithm {
-                                                    calculate::util::Algorithm::Optimal => {
-                                                        "optimal algorithm"
-                                                    }
-                                                    calculate::util::Algorithm::Genetic => {
-                                                        "fast algorithm"
-                                                    }
-                                                };
-
-                                                egui::ComboBox::from_id_salt("algorithm_select")
-                                                    .selected_text(algorithm)
-                                                    .show_ui(ui, |ui| {
-                                                        if ui.button("optimal algorithm").clicked()
-                                                        {
-                                                            algorithm = "optimal algorithm";
-                                                            settings.algorithm =
-                                                                calculate::util::Algorithm::Optimal;
-                                                        }
-                                                        if ui.button("fast algorithm").clicked() {
-                                                            algorithm = "fast algorithm";
-                                                            settings.algorithm =
-                                                                calculate::util::Algorithm::Genetic;
-                                                        }
-                                                    });
                                             },
                                         );
                                     });
                             }
                             ui.separator();
                             ui.horizontal_wrapped(|ui| {
+                                let can_start =
+                                    self.gui.configuring_generation.as_ref().is_some_and(
+                                        |(_, settings, _)| {
+                                            settings.algorithm.supports_sidelen(settings.sidelen)
+                                        },
+                                    );
                                 if ui
-                                    .add(egui::Button::new(egui::RichText::new("start!").strong()))
+                                    .add_enabled(
+                                        can_start,
+                                        egui::Button::new(egui::RichText::new("start").strong()),
+                                    )
                                     .clicked()
                                 {
                                     if let Some((img, mut settings, _)) =
@@ -755,9 +754,8 @@ impl App for ObamifyApp {
                                                 / (settings.sidelen as f32 / 128.0))
                                                 as i64;
 
-                                        self.gui
-                                            .process_cancelled
-                                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                                        let cancel_token = Arc::new(AtomicBool::new(false));
+                                        self.gui.process_cancelled = Some(Arc::clone(&cancel_token));
 
                                         let unprocessed = UnprocessedPreset {
                                             name: settings.name.clone(),
@@ -766,11 +764,7 @@ impl App for ObamifyApp {
                                             source_img: img.into_raw(),
                                         };
 
-                                        self.resize_textures(
-                                            device,
-                                            (settings.sidelen, settings.sidelen),
-                                            false,
-                                        );
+                                        self.resize_textures(device, (settings.sidelen, settings.sidelen));
 
                                         #[cfg(target_arch = "wasm32")]
                                         {
@@ -781,7 +775,7 @@ impl App for ObamifyApp {
                                         {
                                             std::thread::spawn({
                                                 let tx = self.progress_tx.clone();
-                                                let cancelled = self.gui.process_cancelled.clone();
+                                                let cancelled = cancel_token;
                                                 move || {
                                                     let result = calculate::process(
                                                         unprocessed,
@@ -790,10 +784,9 @@ impl App for ObamifyApp {
                                                         cancelled,
                                                     );
                                                     if let Err(err) = result {
-                                                        tx.send(ProgressMsg::Error(
+                                                        let _ = tx.send(ProgressMsg::Error(
                                                             err.to_string(),
-                                                        ))
-                                                        .ok();
+                                                        ));
                                                     }
                                                 }
                                             });
@@ -819,7 +812,7 @@ impl App for ObamifyApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_BOTTOM, (0.0, 0.0))
                 .show(ctx, |ui| {
-                    let processing_label_message = "processing...";
+                    let processing_label_message = "processing…";
                     ui.vertical(|ui| {
                         ui.set_min_width(ui.available_width().min(400.0));
                         while let Some(msg) = self.get_latest_msg() {
@@ -829,7 +822,6 @@ impl App for ObamifyApp {
                                     self.resize_textures(
                                         device,
                                         (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
-                                        false,
                                     );
                                     //self.gui.presets = get_presets();
                                     self.gui.presets.push(new_preset.clone());
@@ -849,10 +841,16 @@ impl App for ObamifyApp {
                                     self.gui.last_progress = p;
                                 }
                                 ProgressMsg::Error(err) => {
-                                    ui.label(format!("error: {}", err));
-                                    if ui.button("close").clicked() {
-                                        ui.close();
-                                    }
+                                    self.preview_image = None;
+                                    self.resize_textures(
+                                        device,
+                                        (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
+                                    );
+                                    self.gui.last_progress = 0.0;
+                                    self.gui.hide_progress_modal();
+                                    self.gui.show_error(err);
+                                    ui.close();
+                                    break;
                                 }
                                 ProgressMsg::UpdatePreview {
                                     width,
@@ -867,21 +865,27 @@ impl App for ObamifyApp {
                                     self.resize_textures(
                                         device,
                                         (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
-                                        false,
                                     );
                                     self.gui.hide_progress_modal();
                                     ui.close();
                                 }
                                 ProgressMsg::UpdateAssignments(assignments) => {
-                                    self.sim.set_assignments(assignments, self.size.0)
+                                    if matches!(self.gui.mode, GuiMode::Draw) {
+                                        self.sim.set_assignments(assignments, self.size.0);
+                                    }
                                 }
                             }
                         }
 
-                        if self.gui.process_cancelled.load(Ordering::Relaxed) {
-                            ui.label("cancelling...");
+                        if self
+                            .gui
+                            .process_cancelled
+                            .as_ref()
+                            .is_some_and(|t| t.load(Ordering::Relaxed))
+                        {
+                            ui.label("cancelling…");
                         } else if self.gui.last_progress == 0.0 {
-                            ui.label("preparing...");
+                            ui.label("preparing…");
                         } else {
                             ui.label(processing_label_message);
                         }
@@ -899,12 +903,13 @@ impl App for ObamifyApp {
                                     self.resize_textures(
                                         device,
                                         (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
-                                        false,
                                     );
                                     self.gui.hide_progress_modal();
                                     ui.close();
                                 }
-                                self.gui.process_cancelled.store(true, Ordering::Relaxed);
+                                if let Some(ref token) = self.gui.process_cancelled {
+                                    token.store(true, Ordering::Relaxed);
+                                }
                                 self.gui.last_progress = 0.0;
                             }
                         })
@@ -916,7 +921,7 @@ impl App for ObamifyApp {
                 |ui| {
                     match self.gif_recorder.status.clone() {
                         GifStatus::Recording => {
-                            ui.label("recording gif...");
+                            ui.label("Recording GIF…");
                             if ui.button("cancel").clicked() {
                                 self.stop_recording_gif(device, &rs.queue);
                                 self.gui.animate = false;
@@ -933,10 +938,10 @@ impl App for ObamifyApp {
                         }
                         #[cfg(not(target_arch = "wasm32"))]
                         GifStatus::Complete(path) => {
-                            ui.label("gif saved!");
+                            ui.label("GIF saved!");
                             ui.horizontal(|ui| {
                                 if ui.button("open file").clicked() {
-                                    opener::reveal(path).ok();
+                                    let _ = opener::reveal(path);
                                 }
                                 if ui.button("close").clicked() {
                                     self.stop_recording_gif(device, &rs.queue);
@@ -971,7 +976,7 @@ impl App for ObamifyApp {
             }
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new())
+            .frame(egui::Frame::new().fill(Color32::from_rgb(13, 17, 23)))
             .show(ctx, |ui| {
                 ui.with_layout(
                     egui::Layout::centered_and_justified(egui::Direction::TopDown),
@@ -982,9 +987,8 @@ impl App for ObamifyApp {
                             let desired = full.x.min(full.y) * egui::vec2(1.0, aspect);
                             ui.add(egui::Image::new((id, desired)).maintain_aspect_ratio(true));
 
-                            #[cfg(not(target_arch = "wasm32"))]
                             if matches!(self.gui.mode, GuiMode::Draw) {
-                                self.handle_drawing(ctx, device, &rs.queue, ui, aspect);
+                                self.handle_drawing(ctx, &rs.queue, ui, aspect);
                             }
                         } else {
                             ui.colored_label(Color32::LIGHT_RED, "Texture not ready");
@@ -992,7 +996,10 @@ impl App for ObamifyApp {
                     },
                 );
             });
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(target_arch = "wasm32")]
+        if matches!(self.gui.mode, GuiMode::Draw) {
+            self.advance_drawing_optimizer();
+        }
         if matches!(self.gui.mode, GuiMode::Draw) {
             let number_keys = [
                 egui::Key::Num1,
@@ -1006,10 +1013,10 @@ impl App for ObamifyApp {
 
             let colors = [
                 ("black", 0x000000),
-                ("a", 0x86d9e3),
-                ("b", 0x383232),
-                ("c", 0xD49976),
-                ("d", 0x793025),
+                ("teal", 0x86d9e3),
+                ("charcoal", 0x383232),
+                ("peach", 0xD49976),
+                ("rust", 0x793025),
             ];
 
             for (idx, (_name, color)) in colors.iter().enumerate() {
@@ -1159,20 +1166,66 @@ impl App for ObamifyApp {
         }
 
         // continuous repaint for animation
-        ctx.request_repaint();
+        if self.gui.animate
+            || matches!(self.gui.mode, GuiMode::Draw)
+            || self.preview_image.is_some()
+            || self.gif_recorder.is_recording()
+        {
+            ctx.request_repaint();
+        }
         self.frame_count += 1;
     }
 }
 
-fn prompt_image(
-    title: &'static str,
-    app: &mut ObamifyApp,
-    callback: impl FnOnce(String, image::RgbImage, &mut ObamifyApp) + 'static,
-) {
+impl ObamifyApp {
+    fn apply_image_prompt_result(
+        &mut self,
+        action: ImagePromptAction,
+        name: String,
+        img: SourceImg,
+    ) {
+        let img = ensure_reasonable_size(img);
+        match action {
+            ImagePromptAction::NewPreset => {
+                self.gui.configuring_generation = Some((
+                    img,
+                    GenerationSettings::default(Uuid::new_v4(), name),
+                    GuiImageCache::default(),
+                ));
+                #[cfg(target_arch = "wasm32")]
+                hide_icons();
+            }
+            ImagePromptAction::ChangeSource => {
+                if let Some((src, _, cache)) = &mut self.gui.configuring_generation {
+                    *src = img;
+                    cache.source_preview = None;
+                }
+            }
+            ImagePromptAction::ChangeTarget => {
+                if let Some((_, settings, cache)) = &mut self.gui.configuring_generation {
+                    settings.set_raw_target(img);
+                    cache.target_preview = None;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn apply_pending_image_results(&mut self) {
+        while let Some(pending) = { self.pending_images.borrow_mut().pop_front() } {
+            match pending.result {
+                Ok((name, img)) => self.apply_image_prompt_result(pending.action, name, img),
+                Err(err) => self.gui.show_error(err),
+            }
+        }
+    }
+}
+
+fn prompt_image(title: &'static str, app: &mut ObamifyApp, action: ImagePromptAction) {
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen_futures::spawn_local;
-        let app_ptr: *mut ObamifyApp = app;
+        let pending_images = app.pending_images.clone();
 
         spawn_local(async move {
             if let Some(handle) = rfd::AsyncFileDialog::new()
@@ -1183,18 +1236,12 @@ fn prompt_image(
             {
                 let name = get_default_preset_name(handle.file_name());
                 let data = handle.read().await;
-                match image::load_from_memory(&data) {
-                    Ok(img) => unsafe {
-                        if let Some(app) = app_ptr.as_mut() {
-                            callback(name, img.to_rgb8(), app);
-                        }
-                    },
-                    Err(e) => unsafe {
-                        if let Some(app) = app_ptr.as_mut() {
-                            app.gui.show_error(format!("failed to load image: {}", e));
-                        }
-                    },
-                }
+                let result = image::load_from_memory(&data)
+                    .map(|img| (name, img.to_rgb8()))
+                    .map_err(|e| format!("failed to load image: {e}"));
+                pending_images
+                    .borrow_mut()
+                    .push_back(PendingImageResult { action, result });
             }
         });
     }
@@ -1210,10 +1257,110 @@ fn prompt_image(
                 get_default_preset_name(file.file_name().unwrap().to_string_lossy().to_string());
 
             match image::open(file) {
-                Ok(img) => callback(name, img.to_rgb8(), app),
+                Ok(img) => app.apply_image_prompt_result(action, name, img.to_rgb8()),
                 Err(e) => app.gui.show_error(format!("failed to load image: {}", e)),
             }
         }
+    }
+}
+
+fn apply_studio_style(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = Color32::from_rgb(8, 9, 10);
+    visuals.window_fill = Color32::from_rgb(18, 22, 23);
+    visuals.faint_bg_color = Color32::from_rgb(22, 27, 29);
+    visuals.extreme_bg_color = Color32::from_rgb(6, 7, 8);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(28, 34, 36);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 49, 52);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(47, 91, 99);
+    visuals.selection.bg_fill = Color32::from_rgb(58, 112, 122);
+    visuals.hyperlink_color = Color32::from_rgb(115, 199, 211);
+    visuals.override_text_color = Some(Color32::from_rgb(219, 229, 231));
+    visuals.window_corner_radius = egui::CornerRadius::same(14);
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.visuals.window_shadow = egui::epaint::Shadow {
+        offset: [0, 16],
+        blur: 36,
+        spread: 0,
+        color: egui::Color32::from_rgba_unmultiplied(10, 15, 20, 90),
+    };
+    ctx.set_style(style);
+}
+
+fn algorithm_picker_ui(ui: &mut egui::Ui, settings: &mut GenerationSettings) {
+    use calculate::util::{Algorithm, AlgorithmGroup};
+
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new("Algorithm")
+                .strong()
+                .color(Color32::from_rgb(230, 238, 240)),
+        );
+        ui.label(
+            egui::RichText::new("Choose how source pixels are assigned to the target.")
+                .small()
+                .color(Color32::from_rgb(145, 158, 162)),
+        );
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Modes").weak().small());
+        ui.horizontal_wrapped(|ui| {
+            for alg in Algorithm::ALL {
+                if alg.info().group == AlgorithmGroup::Mode {
+                    algorithm_option_button(ui, settings, alg);
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Advanced").weak().small());
+        ui.horizontal_wrapped(|ui| {
+            for alg in Algorithm::ALL {
+                if alg.info().group == AlgorithmGroup::Algorithm {
+                    algorithm_option_button(ui, settings, alg);
+                }
+            }
+        });
+
+        if !settings.algorithm.supports_sidelen(settings.sidelen) {
+            ui.colored_label(
+                Color32::from_rgb(255, 140, 128),
+                "Selected algorithm is capped below this resolution. Lower resolution or choose Multiscale/Balanced.",
+            );
+        }
+    });
+}
+
+fn algorithm_option_button(
+    ui: &mut egui::Ui,
+    settings: &mut GenerationSettings,
+    algorithm: calculate::util::Algorithm,
+) {
+    let info = algorithm.info();
+    let selected = settings.algorithm == info.algorithm;
+    let supported = info.algorithm.supports_sidelen(settings.sidelen);
+    let label = if let Some(max) = info.max_sidelen {
+        format!("{}  <= {}x{}", info.algorithm.short_label(), max, max)
+    } else {
+        info.algorithm.short_label().to_owned()
+    };
+
+    let mut button = egui::Button::selectable(selected, label).min_size(egui::vec2(104.0, 30.0));
+    if selected {
+        button = button.fill(Color32::from_rgb(46, 88, 96));
+    }
+
+    let response = ui.add_enabled(supported, button).on_hover_text(format!(
+        "{}\n{}",
+        info.algorithm.label(),
+        info.description
+    ));
+    if response.clicked() {
+        settings.algorithm = info.algorithm;
     }
 }
 
@@ -1239,22 +1386,24 @@ fn image_overlap_preview(
     get_raw_target: &SourceImg,
     blend: f32,
 ) {
-    let tex = if cache.overlap_preview.is_none()
-        || cache.source_preview.is_none()
-        || cache.target_preview.is_none()
-    {
-        let src_img = settings.source_crop_scale.apply(source_img, 64);
-        let tgt_img = settings.target_crop_scale.apply(get_raw_target, 64);
-        let blended = blend_rgb_images(&src_img, &tgt_img, blend);
-        let p = ui.ctx().load_texture(
-            arg,
-            egui::ColorImage::from_rgb([64, 64], blended.as_raw()),
-            egui::TextureOptions::LINEAR,
-        );
-        cache.overlap_preview = Some(p.clone());
-        p
-    } else {
-        cache.overlap_preview.as_ref().unwrap().clone()
+    let tex = match (
+        cache.overlap_preview.as_ref(),
+        cache.source_preview.as_ref(),
+        cache.target_preview.as_ref(),
+    ) {
+        (Some(o), Some(_), Some(_)) => o.clone(),
+        _ => {
+            let src_img = settings.source_crop_scale.apply(source_img, 64);
+            let tgt_img = settings.target_crop_scale.apply(get_raw_target, 64);
+            let blended = blend_rgb_images(&src_img, &tgt_img, blend);
+            let p = ui.ctx().load_texture(
+                arg,
+                egui::ColorImage::from_rgb([64, 64], blended.as_raw()),
+                egui::TextureOptions::LINEAR,
+            );
+            cache.overlap_preview = Some(p.clone());
+            p
+        }
     };
     ui.add(egui::Image::from_texture(&tex));
 }
@@ -1299,13 +1448,13 @@ fn image_crop_gui(
                 [slider_w, 20.0],
                 egui::Slider::new(&mut crop_scale.x, -1.0..=1.0)
                     .show_value(false)
-                    .text("x-off."),
+                    .text("x offset"),
             );
             ui.add_sized(
                 [slider_w, 20.0],
                 egui::Slider::new(&mut crop_scale.y, -1.0..=1.0)
                     .show_value(false)
-                    .text("y-off."),
+                    .text("y offset"),
             );
 
             if values != *crop_scale {
@@ -1317,47 +1466,18 @@ fn image_crop_gui(
     open_file_dialog
 }
 
-fn get_default_preset_name(mut n: String) -> String {
-    let mut name = {
-        if let Some(dot) = n.rfind('.') {
-            if dot > 0 {
-                n.truncate(dot);
-            }
-        }
-        if n.is_empty() {
-            "untitled".to_owned()
-        } else {
-            n
-        }
-    };
+fn get_default_preset_name(n: String) -> String {
+    let mut name = std::path::Path::new(&n)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("untitled")
+        .to_owned();
     if name.chars().count() > 20 {
         name = name.chars().take(20).collect();
     }
     name
 }
-
-// fn blend_rgb_images(a: &image::RgbImage, b: &image::RgbImage, alpha: f32) -> image::RgbImage {
-//     assert_eq!(
-//         a.dimensions(),
-//         b.dimensions(),
-//         "Images must have same dimensions"
-//     );
-//     let (w, h) = a.dimensions();
-//     let alpha = alpha.clamp(0.0, 1.0);
-//     let inv = 1.0 - alpha;
-//     let mut out = image::RgbImage::new(w, h);
-//     for y in 0..h {
-//         for x in 0..w {
-//             let pa = a.get_pixel(x, y);
-//             let pb = b.get_pixel(x, y);
-//             let r = (pa[0] as f32 * inv + pb[0] as f32 * alpha).round() as u8;
-//             let g = (pa[1] as f32 * inv + pb[1] as f32 * alpha).round() as u8;
-//             let bch = (pa[2] as f32 * inv + pb[2] as f32 * alpha).round() as u8;
-//             out.put_pixel(x, y, image::Rgb([r, g, bch]));
-//         }
-//     }
-//     out
-// }
 
 pub fn blend_rgb_images(a: &SourceImg, b: &SourceImg, alpha: f32) -> SourceImg {
     assert_eq!(

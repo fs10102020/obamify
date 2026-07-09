@@ -10,6 +10,17 @@ rust-version = "1.85"
 all-features = true
 targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 
+[lints.rust]
+future-incompatible = { level = "warn", priority = -2 }
+missing_docs = "warn"
+nonstandard_style = { level = "deny", priority = -3 }
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+redundant_clone = "deny"
+undocumented_unsafe_blocks = "deny"
+
 [dependencies]
 egui = "0.32"
 eframe = { version = "0.32", default-features = false, features = [
@@ -20,16 +31,15 @@ eframe = { version = "0.32", default-features = false, features = [
     "wayland",       # To support Linux (and CI)
     "x11",           # To support older Linux distributions (restores one of the default features)
 ] }
-egui_extras = { version = "0.32", features = ["svg"] }
+
 log = "0.4.27"
 egui-wgpu = "0.32.1"
 wgpu = { version = "25.0", default-features = false, features = ["wgsl"] }
 bytemuck = { version = "1.16", features = ["derive"] }
-image = { version = "0.25.6", features = ["serde"] }
+image = "0.25.6"
 
-palette = "0.7.6"
-pathfinding = "4.13.0"
-indexmap = "2.11.0"
+
+
 
 frand = "0.10.1"
 uuid = { version = "1.18.1", features = ["v4", "js", "serde"] }
@@ -37,8 +47,6 @@ uuid = { version = "1.18.1", features = ["v4", "js", "serde"] }
 rfd = "0.15.4"
 
 gif = "0.13.3"
-futures-intrusive = "0.5.0"
-pollster = "0.4.0"
 color_quant = "1.1.0"
 opener = {version = "0.8.3", features = ["reveal"]}
 
@@ -57,7 +65,6 @@ web-sys = { version = "0.3.70", features = [
 ] }             # to access the DOM (to hide the loading text)
 # gloo = { version = "0.11.0", features = ["futures"] }
 serde-wasm-bindgen = "0.6"
-futures = "0.3.31"
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1.7"
 

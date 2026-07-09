@@ -1,14 +1,19 @@
 use crate::app::SeedColor;
 use crate::app::calculate;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::app::calculate::SWAPS_PER_GENERATION_PER_PIXEL;
 use crate::app::preset::UnprocessedPreset;
 
 use std::error::Error;
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::AtomicU32;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
 
+#[cfg(not(target_arch = "wasm32"))]
 use super::ProgressMsg;
 
 use super::GenerationSettings;
@@ -16,17 +21,10 @@ use super::GenerationSettings;
 #[derive(Clone, Copy)]
 pub struct PixelData {
     pub stroke_id: u32,
-    pub last_edited: u32,
 }
 impl PixelData {
-    pub(crate) fn init_canvas(frame_count: u32) -> Vec<PixelData> {
-        vec![
-            PixelData {
-                stroke_id: 0,
-                last_edited: frame_count
-            };
-            DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE
-        ]
+    pub(crate) fn init_canvas() -> Vec<PixelData> {
+        vec![PixelData { stroke_id: 0 }; DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE]
     }
 }
 
@@ -80,12 +78,129 @@ impl DrawingPixel {
 
 pub(crate) const STROKE_REWARD: i64 = -10000000000;
 
+pub(crate) struct DrawingOptimizer {
+    settings: GenerationSettings,
+    target_pixels: Vec<(u8, u8, u8)>,
+    weights: Vec<i64>,
+    pixels: Vec<DrawingPixel>,
+    rng: frand::Rand,
+}
+
+impl DrawingOptimizer {
+    pub(crate) fn new(
+        source: UnprocessedPreset,
+        settings: GenerationSettings,
+        colors: &[SeedColor],
+    ) -> Result<Self, Box<dyn Error>> {
+        let source_img =
+            image::ImageBuffer::from_raw(source.width, source.height, source.source_img.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "invalid canvas source buffer: {}x{} RGB image got {} bytes",
+                        source.width,
+                        source.height,
+                        source.source_img.len()
+                    )
+                })?;
+        let (source_pixels, target_pixels, weights) =
+            calculate::util::get_images(source_img, &settings)?;
+
+        let pixels = source_pixels
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let x = (i as u32 % settings.sidelen) as u16;
+                let y = (i as u32 / settings.sidelen) as u16;
+                let mut p = DrawingPixel::new(x, y, 0);
+                let h = p.calc_drawing_heuristic(
+                    (x, y),
+                    target_pixels[i],
+                    weights[i],
+                    colors,
+                    settings.proximity_importance,
+                ) + STROKE_REWARD;
+                p.update_heuristic(h);
+                p
+            })
+            .collect::<Vec<_>>();
+
+        Ok(Self {
+            settings,
+            target_pixels,
+            weights,
+            pixels,
+            rng: frand::Rand::with_seed(12345),
+        })
+    }
+
+    pub(crate) fn step(
+        &mut self,
+        colors: &[SeedColor],
+        pixel_data: &[PixelData],
+        swap_budget: usize,
+    ) -> Option<Vec<usize>> {
+        let mut swaps_made = 0;
+        let max_search = (DRAWING_CANVAS_SIZE / 4) as i16;
+
+        for _ in 0..swap_budget {
+            let apos = self.rng.gen_range(0..self.pixels.len() as u64) as usize;
+            let ax = apos as u16 % self.settings.sidelen as u16;
+            let ay = apos as u16 / self.settings.sidelen as u16;
+
+            let bx = (ax as i16 + self.rng.gen_range(-max_search..(max_search + 1)))
+                .clamp(0, self.settings.sidelen as i16 - 1) as u16;
+            let by = (ay as i16 + self.rng.gen_range(-max_search..(max_search + 1)))
+                .clamp(0, self.settings.sidelen as i16 - 1) as u16;
+            let bpos = by as usize * self.settings.sidelen as usize + bx as usize;
+
+            let t_a = self.target_pixels[apos];
+            let t_b = self.target_pixels[bpos];
+
+            let a_on_b_h = self.pixels[apos].calc_drawing_heuristic(
+                (bx, by),
+                t_b,
+                self.weights[bpos],
+                colors,
+                self.settings.proximity_importance,
+            ) + stroke_reward(bpos, apos, pixel_data, &self.pixels);
+
+            let b_on_a_h = self.pixels[bpos].calc_drawing_heuristic(
+                (ax, ay),
+                t_a,
+                self.weights[apos],
+                colors,
+                self.settings.proximity_importance,
+            ) + stroke_reward(apos, bpos, pixel_data, &self.pixels);
+
+            let improvement_a = self.pixels[apos].h - b_on_a_h;
+            let improvement_b = self.pixels[bpos].h - a_on_b_h;
+            if improvement_a + improvement_b > 0 {
+                self.pixels.swap(apos, bpos);
+                self.pixels[apos].update_heuristic(b_on_a_h);
+                self.pixels[bpos].update_heuristic(a_on_b_h);
+                swaps_made += 1;
+            }
+        }
+
+        (swaps_made > 0).then(|| self.assignments())
+    }
+
+    fn assignments(&self) -> Vec<usize> {
+        let mut result = Vec::with_capacity(self.pixels.len());
+        result.extend(
+            self.pixels
+                .iter()
+                .map(|p| p.src_y as usize * self.settings.sidelen as usize + p.src_x as usize),
+        );
+        result
+    }
+}
+
 pub(crate) fn stroke_reward(
     newpos: usize,
     oldpos: usize,
     pixel_data: &[PixelData],
     pixels: &[DrawingPixel],
-    frame_count: u32,
 ) -> i64 {
     let x = (newpos % DRAWING_CANVAS_SIZE) as u16;
     let y = (newpos / DRAWING_CANVAS_SIZE) as u16;
@@ -94,7 +209,6 @@ pub(crate) fn stroke_reward(
     let data = pixel_data
         [pixels[oldpos].src_x as usize + pixels[oldpos].src_y as usize * DRAWING_CANVAS_SIZE];
     let stroke_id = data.stroke_id;
-    let _age = frame_count - data.last_edited;
 
     for (dx, dy) in [
         //(-1, -1),
@@ -124,141 +238,244 @@ pub(crate) fn stroke_reward(
     0
 }
 
-#[allow(clippy::too_many_arguments)]
+// Thread entry point takes the state it needs explicitly so ownership across the spawned thread is clear.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn drawing_process_genetic(
     source: UnprocessedPreset,
     settings: GenerationSettings,
     tx: mpsc::SyncSender<ProgressMsg>,
     colors: Arc<std::sync::RwLock<Vec<SeedColor>>>,
     pixel_data: Arc<std::sync::RwLock<Vec<PixelData>>>,
-    frame_count: u32,
     my_id: u32,
     current_id: Arc<AtomicU32>,
 ) -> Result<(), Box<dyn Error>> {
-    let source_img =
-        image::ImageBuffer::from_raw(source.width, source.height, source.source_img.clone())
-            .unwrap();
-    let (source_pixels, target_pixels, weights) =
-        calculate::util::get_images(source_img, &settings)?;
+    let read_colors = colors.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut optimizer = DrawingOptimizer::new(source, settings, &read_colors)?;
+    let swaps_per_generation = SWAPS_PER_GENERATION_PER_PIXEL * read_colors.len();
 
-    let mut pixels = {
-        let read_colors: Vec<SeedColor> = colors.read().unwrap().clone();
-        //let read_pixel_data: Vec<PixelData> = pixel_data.read().unwrap().clone();
-
-        source_pixels
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let x = (i as u32 % settings.sidelen) as u16;
-                let y = (i as u32 / settings.sidelen) as u16;
-                let mut p = DrawingPixel::new(x, y, 0);
-                let h = p.calc_drawing_heuristic(
-                    (x, y),
-                    target_pixels[i],
-                    weights[i],
-                    &read_colors,
-                    settings.proximity_importance,
-                    // &read_pixel_data,
-                ) + STROKE_REWARD;
-                p.update_heuristic(h);
-                p
-            })
-            .collect::<Vec<_>>()
-    };
-
-    let mut rng = frand::Rand::with_seed(12345);
-    fn max_dist(age: u32) -> u32 {
-        (((DRAWING_CANVAS_SIZE / 4) as f32) * (0.99f32).powi(age as i32 / 30)).round() as u32
-    }
-
-    let swaps_per_generation = SWAPS_PER_GENERATION_PER_PIXEL * pixels.len();
+    let mut colors_buf: Vec<SeedColor> = read_colors;
+    let mut pixel_data_buf: Vec<PixelData> =
+        pixel_data.read().unwrap_or_else(|e| e.into_inner()).clone();
 
     loop {
-        let colors: Vec<SeedColor> = {
-            let r = colors.read().unwrap();
-            r.clone()
-        };
-        let pixel_data = {
-            let r = pixel_data.read().unwrap();
-            r.clone()
-        };
-        let mut swaps_made = 0;
-
-        for _ in 0..swaps_per_generation {
-            let apos = rng.gen_range(0..pixels.len() as u64) as usize;
-            let ax = apos as u16 % settings.sidelen as u16;
-            let ay = apos as u16 / settings.sidelen as u16;
-
-            //let stroke_id = pixel_data[apos].stroke_id as usize;
-            let max_dist_a = max_dist(frame_count.saturating_sub(pixel_data[apos].last_edited));
-
-            let bx = (ax as i16 + rng.gen_range(-(max_dist_a as i16)..(max_dist_a as i16 + 1)))
-                .clamp(0, settings.sidelen as i16 - 1) as u16;
-            let by = (ay as i16 + rng.gen_range(-(max_dist_a as i16)..(max_dist_a as i16 + 1)))
-                .clamp(0, settings.sidelen as i16 - 1) as u16;
-            let bpos = by as usize * settings.sidelen as usize + bx as usize;
-
-            let max_dist_b = max_dist(frame_count.saturating_sub(pixel_data[bpos].last_edited));
-            if (bx as i32 - ax as i32).abs() > max_dist_b as i32
-                || (by as i32 - ay as i32).abs() > max_dist_b as i32
-            {
-                continue;
-            }
-
-            let t_a = target_pixels[apos];
-            let t_b = target_pixels[bpos];
-
-            let a_on_b_h = pixels[apos].calc_drawing_heuristic(
-                (bx, by),
-                t_b,
-                weights[bpos],
-                &colors,
-                settings.proximity_importance,
-            ) + stroke_reward(bpos, apos, &pixel_data, &pixels, frame_count);
-
-            let b_on_a_h = pixels[bpos].calc_drawing_heuristic(
-                (ax, ay),
-                t_a,
-                weights[apos],
-                &colors,
-                settings.proximity_importance,
-            ) + stroke_reward(apos, bpos, &pixel_data, &pixels, frame_count);
-
-            let improvement_a = pixels[apos].h - b_on_a_h;
-            let improvement_b = pixels[bpos].h - a_on_b_h;
-            if improvement_a + improvement_b > 0 {
-                // swap
-                pixels.swap(apos, bpos);
-                pixels[apos].update_heuristic(b_on_a_h);
-                pixels[bpos].update_heuristic(a_on_b_h);
-                swaps_made += 1;
-            }
+        {
+            let r = colors.read().unwrap_or_else(|e| e.into_inner());
+            colors_buf.clear();
+            colors_buf.extend_from_slice(&r);
+        }
+        {
+            let r = pixel_data.read().unwrap_or_else(|e| e.into_inner());
+            pixel_data_buf.clear();
+            pixel_data_buf.extend_from_slice(&r);
         }
 
-        //println!("swaps made: {}", swaps_made);
-
-        // let img = make_new_img(&source_pixels, &assignments, target.width());
-        // if swaps_made < 10 || cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-        //     let dir_name = save_result(target, base_name, source, assignments, img)?;
-        //     tx.send(ProgressMsg::Done(PathBuf::from(format!(
-        //         "./presets/{}",
-        //         dir_name
-        //     ))))?;
-        //     return Ok(());
-        // }
-        // tx.send(ProgressMsg::UpdatePreview(img))?;
-        if swaps_made > 0 {
-            let assignments = pixels
-                .iter()
-                .map(|p| p.src_y as usize * settings.sidelen as usize + p.src_x as usize)
-                .collect::<Vec<_>>();
+        if let Some(assignments) =
+            optimizer.step(&colors_buf, &pixel_data_buf, swaps_per_generation)
+        {
             tx.send(ProgressMsg::UpdateAssignments(assignments))?;
         }
         if my_id != current_id.load(std::sync::atomic::Ordering::Relaxed) {
-            tx.send(ProgressMsg::Cancelled).unwrap();
+            let _ = tx.send(ProgressMsg::Cancelled);
             return Ok(());
         }
+    }
+}
 
-        //max_dist = (max_dist as f32 * 0.99).max(4.0) as u32;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_colors(n: usize) -> Vec<SeedColor> {
+        (0..n)
+            .map(|i| {
+                let v = (i % 256) as f32 / 255.0;
+                SeedColor {
+                    rgba: [v, v, v, 1.0],
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_pixel_data_init_canvas_correct_count() {
+        let canvas = PixelData::init_canvas();
+        assert_eq!(canvas.len(), DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE);
+        for pd in &canvas {
+            assert_eq!(pd.stroke_id, 0);
+        }
+    }
+
+    #[test]
+    fn test_drawing_pixel_new_stores_fields() {
+        let p = DrawingPixel::new(10, 20, 999);
+        assert_eq!(p.src_x, 10);
+        assert_eq!(p.src_y, 20);
+        assert_eq!(p.h, 999);
+    }
+
+    #[test]
+    fn test_drawing_pixel_update_heuristic() {
+        let mut p = DrawingPixel::new(0, 0, 100);
+        p.update_heuristic(200);
+        assert_eq!(p.h, 200);
+    }
+
+    #[test]
+    fn test_drawing_pixel_calc_drawing_heuristic_zero_for_matching() {
+        let colors = make_colors(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE);
+        let p = DrawingPixel::new(5, 5, 0);
+        // When source color == target color and position matches, heuristic should be 0
+        let target_col = (colors[5 * DRAWING_CANVAS_SIZE + 5].rgba[0] * 256.0) as u8;
+        let h = p.calc_drawing_heuristic(
+            (5, 5),
+            (target_col, target_col, target_col),
+            255,
+            &colors,
+            0,
+        );
+        assert_eq!(
+            h, 0,
+            "heuristic should be 0 for matching color and position"
+        );
+    }
+
+    #[test]
+    fn test_stroke_reward_returns_reward_with_matching_neighbors() {
+        let n = DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE;
+        let pixel_data: Vec<PixelData> = vec![PixelData { stroke_id: 999 }; n];
+        let pixels: Vec<DrawingPixel> = (0..n)
+            .map(|i| {
+                let x = (i % DRAWING_CANVAS_SIZE) as u16;
+                let y = (i / DRAWING_CANVAS_SIZE) as u16;
+                DrawingPixel::new(x, y, 0)
+            })
+            .collect();
+        let reward = stroke_reward(DRAWING_CANVAS_SIZE / 2, 0, &pixel_data, &pixels);
+        assert_eq!(reward, STROKE_REWARD);
+    }
+
+    #[test]
+    fn test_stroke_reward_returns_zero_with_different_stroke_ids() {
+        let n = DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE;
+        let mut pixel_data: Vec<PixelData> = vec![PixelData { stroke_id: 0 }; n];
+        // Give the oldpos pixel a unique stroke_id
+        pixel_data[0] = PixelData { stroke_id: 42 };
+        let pixels: Vec<DrawingPixel> = (0..n)
+            .map(|i| {
+                let x = (i % DRAWING_CANVAS_SIZE) as u16;
+                let y = (i / DRAWING_CANVAS_SIZE) as u16;
+                DrawingPixel::new(x, y, 0)
+            })
+            .collect();
+        // oldpos=0 → src_x=0, src_y=0 → pixel_data[0].stroke_id = 42
+        // Check neighbors of newpos — they all have stroke_id 0, not 42 → return 0
+        let reward = stroke_reward(
+            DRAWING_CANVAS_SIZE + 1, // position (1,1)
+            0,                       // oldpos 0 → stroke_id 42
+            &pixel_data,
+            &pixels,
+        );
+        assert_eq!(
+            reward, 0,
+            "should return 0 when neighbors have different stroke_id"
+        );
+    }
+
+    #[test]
+    fn test_drawing_optimizer_new_succeeds() {
+        let sidelen = DRAWING_CANVAS_SIZE as u32;
+        let source_img: Vec<u8> = (0..(sidelen * sidelen * 3) as usize)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let source = UnprocessedPreset {
+            name: "test".to_string(),
+            width: sidelen,
+            height: sidelen,
+            source_img,
+        };
+        let settings = GenerationSettings::default(uuid::Uuid::new_v4(), "test".to_string());
+        let colors = make_colors(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE);
+        let result = DrawingOptimizer::new(source, settings, &colors);
+        assert!(
+            result.is_ok(),
+            "DrawingOptimizer::new should succeed with valid input"
+        );
+    }
+
+    #[test]
+    fn test_drawing_optimizer_new_rejects_invalid_buffer() {
+        let source = UnprocessedPreset {
+            name: "test".to_string(),
+            width: 128,
+            height: 128,
+            source_img: vec![0; 10], // way too small
+        };
+        let settings = GenerationSettings::default(uuid::Uuid::new_v4(), "test".to_string());
+        let colors = make_colors(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE);
+        let result = DrawingOptimizer::new(source, settings, &colors);
+        assert!(result.is_err(), "should reject invalid source buffer");
+    }
+
+    #[test]
+    fn test_drawing_optimizer_step_returns_assignments_on_swaps() {
+        let sidelen = DRAWING_CANVAS_SIZE as u32;
+        // Create a source where pixels are clearly mismatched with target
+        let source_img: Vec<u8> = (0..(sidelen * sidelen * 3) as usize)
+            .map(|i| ((i * 7) % 256) as u8)
+            .collect();
+        let source = UnprocessedPreset {
+            name: "test".to_string(),
+            width: sidelen,
+            height: sidelen,
+            source_img,
+        };
+        let mut settings = GenerationSettings::default(uuid::Uuid::new_v4(), "test".to_string());
+        settings.proximity_importance = 1;
+        let colors = make_colors(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE);
+        let mut optimizer = DrawingOptimizer::new(source, settings, &colors).unwrap();
+        let pixel_data = PixelData::init_canvas();
+        // Run several steps — at least one should produce assignments
+        let mut got_assignments = false;
+        for _ in 0..10 {
+            if optimizer.step(&colors, &pixel_data, 4096).is_some() {
+                got_assignments = true;
+                break;
+            }
+        }
+        assert!(
+            got_assignments,
+            "optimizer step should eventually produce assignments"
+        );
+    }
+
+    #[test]
+    fn test_drawing_optimizer_assignments_is_valid_permutation() {
+        let sidelen = DRAWING_CANVAS_SIZE as u32;
+        let source_img: Vec<u8> = vec![128; (sidelen * sidelen * 3) as usize];
+        let source = UnprocessedPreset {
+            name: "test".to_string(),
+            width: sidelen,
+            height: sidelen,
+            source_img,
+        };
+        let settings = GenerationSettings::default(uuid::Uuid::new_v4(), "test".to_string());
+        let colors = make_colors(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE);
+        let mut optimizer = DrawingOptimizer::new(source, settings, &colors).unwrap();
+        let pixel_data = PixelData::init_canvas();
+        // Run steps until we get assignments
+        for _ in 0..20 {
+            if let Some(assignments) = optimizer.step(&colors, &pixel_data, 8192) {
+                let n = DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE;
+                // Verify it's a valid permutation
+                assert_eq!(assignments.len(), n);
+                let mut seen = vec![false; n];
+                for &a in &assignments {
+                    assert!(a < n, "assignment out of range: {a}");
+                    assert!(!std::mem::replace(&mut seen[a], true), "duplicate: {a}");
+                }
+                return;
+            }
+        }
+        panic!("optimizer never produced assignments in 20 steps");
     }
 }

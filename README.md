@@ -6,12 +6,31 @@ revolutionary new technology that turns any image into obama
 
 # How to use
 
-**Use the ui at the top of the window to control the animation, choose between saved transformations, and generate new ones.** You can change the source image and target image, and choose how they are cropped to a square (tip: if both the images are faces, try making the eyes overlap). You can also change these advanced settings:
+**Use the studio controls to play transformations, choose saved presets, generate new ones, or switch into drawing mode.** You can change the source image and target image, choose how they are cropped to a square (tip: if both the images are faces, try making the eyes overlap), and pick the assignment algorithm directly in the creation panel. Drawing mode is available on native and web builds; the web build advances the drawing optimizer incrementally to keep the browser responsive.
 | Setting               | Description                                                                                     |
 |-----------------------|-------------------------------------------------------------------------------------------------|
 | resolution            | How many cells the images will be divided into. Higher resolution will capture more high frequency details. |
 | proximity importance  | How much the algorithm changes the original image to make it look like the target image. Increase this if you want a more subtle transformation. |
-| algorithm             | The algorithm used to calculate the assignment of each pixel. Optimal will find the mathematically optimal solution, but is extremely slow for high resolutions. |
+| algorithm             | The algorithm used to calculate the assignment of each pixel. See the algorithm table below. |
+
+## Algorithm selection
+
+The creation panel exposes three **composed modes** and seven individual algorithms:
+
+| Mode / Algorithm | Description | Performance |
+|------------------|-------------|-------------|
+| **Fast mode** | PatchMatch correspondence search → sparse auction → local swaps | Fastest; good for preview |
+| **Balanced mode** | Multiscale sparse auction: 16×16 exact JV → candidate expansion → sparse ε-scaling auction through the selected resolution → 2-opt | Best speed/quality compromise |
+| **Maximum mode** | Balanced result → dense auction refinement (small images only) → extended swaps | Highest quality, small images only |
+| Multiscale (sparse auction) | Same as Balanced mode — coarse-to-fine sparse candidate matching | Fast, high quality |
+| Auction (ε-scaling) | Dense forward auction with ε-scaling. Limited to small images (≤64 sidelen) to avoid memory issues. | Approximate-to-exact |
+| Jonker-Volgenant (exact) | Proven Kuhn-Munkres exact baseline. Limited to ≤64 sidelen in the UI. | Exact, use for small grids |
+| Hungarian (exact, slow) | Legacy inlined Hungarian algorithm. Limited to ≤64 sidelen in the UI. | Exact, use for small grids |
+| Genetic (legacy fast) | Legacy random pair-swap annealing. | Fast, approximate |
+| Sinkhorn OT | Entropy-regularized optimal transport + rounding to a permutation. Limited to small images (≤32 sidelen). | Novelty; experimental |
+| PatchMatch + repair | Propagation/random search correspondence, then sparse auction repair. | Fast heuristic |
+
+The default algorithm is **Multiscale sparse auction**, which is equivalent to Balanced mode and supports arbitrary square resolutions in the UI range.
 
 # Installations
 

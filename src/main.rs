@@ -1,3 +1,5 @@
+//! Native and WASM launch entry points for obamify.
+
 #![warn(clippy::all, rust_2018_idioms)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
@@ -33,7 +35,7 @@ fn start_app() {
     //web_sys::console::log_1(&"Starting obamify...".into());
 
     // Redirect `log` message to `console.log` and friends:
-    eframe::WebLogger::init(log::LevelFilter::Warn).ok();
+    let _ = eframe::WebLogger::init(log::LevelFilter::Warn);
 
     let web_options = eframe::WebOptions {
         wgpu_options: egui_wgpu::WgpuConfiguration {
@@ -92,10 +94,10 @@ fn start_app() {
                 Err(e) => {
                     use web_sys::js_sys::JsString;
 
-                    loading_text.set_inner_html(&format!(
-                        "<div> Please enable hardware acceleration in your browser :) </div> <div class=\"error\"> Error: {} </div>",
+                    loading_text.set_text_content(Some(&format!(
+                        "Please enable hardware acceleration in your browser :) Error: {}",
                         std::convert::Into::<JsString>::into(e.clone())
-                    ));
+                    )));
                     panic!("Failed to start eframe: {e:?}");
                 }
             }
@@ -104,6 +106,7 @@ fn start_app() {
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Dispatches the WASM binary between page startup and dedicated-worker startup.
 pub fn main() {
     use wasm_bindgen::JsCast as _;
     console_error_panic_hook::set_once();

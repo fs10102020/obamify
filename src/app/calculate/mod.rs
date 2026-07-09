@@ -1,30 +1,22 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, atomic::AtomicBool};
-#[cfg(not(target_arch = "wasm32"))]
+pub mod algorithms;
 pub mod drawing_process;
 pub mod util;
 
 #[cfg(target_arch = "wasm32")]
 pub mod worker;
 
-fn _debug_print(s: String) {
-    #[cfg(target_arch = "wasm32")]
-    web_sys::console::log_1(&s.into());
-    #[cfg(not(target_arch = "wasm32"))]
-    println!("{}", s);
-}
-
 use crate::app::calculate::util::Algorithm;
 use crate::app::{
     calculate::util::{GenerationSettings, ProgressSink},
     preset::{Preset, UnprocessedPreset},
 };
-use egui::ahash::AHasher;
-use pathfinding::prelude::Weights;
 use serde::{Deserialize, Serialize};
 
+/// Cost heuristic: weighted sum of color distance and squared spatial distance.
 #[inline(always)]
-fn heuristic(
+pub(crate) fn heuristic(
     apos: (u16, u16),
     bpos: (u16, u16),
     a: (u8, u8, u8),
@@ -32,11 +24,15 @@ fn heuristic(
     color_weight: i64,
     spatial_weight: i64,
 ) -> i64 {
-    let spatial = (apos.0 as i64 - bpos.0 as i64).pow(2) + (apos.1 as i64 - bpos.1 as i64).pow(2);
-    let color = (a.0 as i64 - b.0 as i64).pow(2)
-        + (a.1 as i64 - b.1 as i64).pow(2)
-        + (a.2 as i64 - b.2 as i64).pow(2);
-    color * color_weight + (spatial * spatial_weight).pow(2)
+    let dx = apos.0 as i64 - bpos.0 as i64;
+    let dy = apos.1 as i64 - bpos.1 as i64;
+    let spatial = dx * dx + dy * dy;
+    let dr = a.0 as i64 - b.0 as i64;
+    let dg = a.1 as i64 - b.1 as i64;
+    let db = a.2 as i64 - b.2 as i64;
+    let color = dr * dr + dg * dg + db * db;
+    let weighted_spatial = spatial * spatial_weight;
+    color * color_weight + weighted_spatial * weighted_spatial
 }
 
 struct ImgDiffWeights<'a> {
@@ -47,10 +43,7 @@ struct ImgDiffWeights<'a> {
     settings: &'a GenerationSettings,
 }
 
-// const TARGET_IMAGE_PATH: &str = "./target.png";
-// const TARGET_WEIGHTS_PATH: &str = "./weights.png";
-
-impl Weights<i64> for ImgDiffWeights<'_> {
+impl ImgDiffWeights<'_> {
     fn rows(&self) -> usize {
         self.target.len()
     }
@@ -75,12 +68,9 @@ impl Weights<i64> for ImgDiffWeights<'_> {
             self.settings.proximity_importance,
         )
     }
-
-    fn neg(&self) -> Self {
-        todo!()
-    }
 }
 
+/// Progress messages sent from background computation to the GUI.
 #[derive(Serialize, Deserialize)]
 pub enum ProgressMsg {
     Progress(f32),
@@ -95,21 +85,7 @@ pub enum ProgressMsg {
     Cancelled,
 }
 
-impl ProgressMsg {
-    pub fn typ(&self) -> &'static str {
-        match self {
-            ProgressMsg::Progress(_) => "progress",
-            ProgressMsg::UpdatePreview { .. } => "update_preview",
-            ProgressMsg::UpdateAssignments(_) => "update_assignments",
-            ProgressMsg::Done(_) => "done",
-            ProgressMsg::Error(_) => "error",
-            ProgressMsg::Cancelled => "cancelled",
-        }
-    }
-}
-
-type FxIndexSet<K> = indexmap::IndexSet<K, std::hash::BuildHasherDefault<AHasher>>;
-
+/// Legacy Hungarian (Kuhn-Munkres) exact assignment solver. Inlined from `pathfinding::kuhn_munkres`.
 pub fn process_optimal<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
@@ -121,9 +97,24 @@ pub fn process_optimal<S: ProgressSink>(
         unprocessed.height,
         unprocessed.source_img.clone(),
     )
-    .unwrap();
+    .ok_or_else(|| {
+        format!(
+            "invalid source image buffer: {}x{} requires {} RGB bytes, got {}",
+            unprocessed.width,
+            unprocessed.height,
+            unprocessed.width as usize * unprocessed.height as usize * 3,
+            unprocessed.source_img.len()
+        )
+    })?;
     // let start_time = std::time::Instant::now();
     let (source_pixels, target_pixels, weights) = util::get_images(source_img, &settings)?;
+    if target_pixels.len() > algorithms::MAX_EXACT_N {
+        tx.send(ProgressMsg::Error(format!(
+            "Hungarian exact solve is limited to {} pixels; use Multiscale or Balanced for this resolution",
+            algorithms::MAX_EXACT_N
+        )));
+        return Ok(());
+    }
 
     let weights = ImgDiffWeights {
         source: source_pixels.clone(),
@@ -154,7 +145,8 @@ pub fn process_optimal<S: ProgressSink>(
         let mut ly: Vec<i64> = vec![0; ny];
         // s, augmenting, and slack will be reset every time they are reused. augmenting
         // contains Some(prev) when the corresponding node belongs to the augmenting path.
-        let mut s = FxIndexSet::<usize>::default();
+        let mut s_list: Vec<usize> = Vec::with_capacity(nx);
+        let mut s_set: Vec<bool> = vec![false; nx];
         let mut alternating = Vec::with_capacity(ny);
         let mut slack = vec![0; ny];
         let mut slackx = Vec::with_capacity(ny);
@@ -164,8 +156,10 @@ pub fn process_optimal<S: ProgressSink>(
             // Find y such that the path is augmented. This will be set when breaking for the
             // loop below. Above the loop is some code to initialize the search.
             let mut y = {
-                s.clear();
-                s.insert(root);
+                s_list.clear();
+                s_set.fill(false);
+                s_list.push(root);
+                s_set[root] = true;
                 // Slack for a vertex y is, initially, the margin between the
                 // sum of the labels of root and y, and the weight between root and y.
                 // As we add x nodes to the alternating path, we update the slack to
@@ -176,7 +170,7 @@ pub fn process_optimal<S: ProgressSink>(
                 slackx.clear();
                 slackx.resize(ny, root);
                 Some(loop {
-                    let mut delta = pathfinding::num_traits::Bounded::max_value();
+                    let mut delta = i64::MAX;
                     let mut x = 0;
                     let mut y = 0;
                     // Select one of the smallest slack delta and its edge (x, y)
@@ -193,7 +187,7 @@ pub fn process_optimal<S: ProgressSink>(
                     // The slack of y nodes outside the alternating path will be reduced
                     // by this minimal slack as well.
                     if delta > 0 {
-                        for &x in &s {
+                        for &x in &s_list {
                             lx[x] -= delta;
                         }
                         for y in 0..ny {
@@ -213,7 +207,8 @@ pub fn process_optimal<S: ProgressSink>(
                     // This y node had a predecessor, add it to the set of x nodes
                     // in the augmenting path.
                     let x = yx[y].unwrap();
-                    s.insert(x);
+                    s_list.push(x);
+                    s_set[x] = true;
                     // Update slack because of the added vertex in s might contain a
                     // greater slack than with previously inserted x nodes in the augmenting
                     // path.
@@ -270,10 +265,6 @@ pub fn process_optimal<S: ProgressSink>(
         )
     };
 
-    //let img = make_new_img(&source_pixels, &assignments, target.width());
-
-    //let dir_name = util::save_result(target, "todo".to_string(), source, assignments, img)?;
-
     tx.send(ProgressMsg::Done(Preset {
         inner: UnprocessedPreset {
             name: unprocessed.name,
@@ -284,7 +275,7 @@ pub fn process_optimal<S: ProgressSink>(
                 .flat_map(|(r, g, b)| [r, g, b])
                 .collect(),
         },
-        assignments: assignments.clone(),
+        assignments,
     }));
 
     // println!(
@@ -294,7 +285,12 @@ pub fn process_optimal<S: ProgressSink>(
     Ok(())
 }
 
-fn make_new_img(source_pixels: &[(u8, u8, u8)], assignments: &[usize], sidelen: u32) -> Vec<u8> {
+/// Build a preview image by rearranging source pixels according to assignments.
+pub(crate) fn make_new_img(
+    source_pixels: &[(u8, u8, u8)],
+    assignments: &[usize],
+    sidelen: u32,
+) -> Vec<u8> {
     let mut img = vec![0; (sidelen * sidelen * 3) as usize];
     for (target_idx, source_idx) in assignments.iter().enumerate() {
         let (r, g, b) = source_pixels[*source_idx];
@@ -349,6 +345,7 @@ impl Pixel {
 
 const SWAPS_PER_GENERATION_PER_PIXEL: usize = 128;
 
+/// Random pair-swap annealing optimizer. Fast and approximate.
 pub fn process_genetic<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
@@ -360,7 +357,15 @@ pub fn process_genetic<S: ProgressSink>(
         unprocessed.height,
         unprocessed.source_img.clone(),
     )
-    .unwrap();
+    .ok_or_else(|| {
+        format!(
+            "invalid source image buffer: {}x{} requires {} RGB bytes, got {}",
+            unprocessed.width,
+            unprocessed.height,
+            unprocessed.width as usize * unprocessed.height as usize * 3,
+            unprocessed.source_img.len()
+        )
+    })?;
     // let start_time = std::time::Instant::now();
     let (source_pixels, target_pixels, weights) = util::get_images(source_img, &settings)?;
 
@@ -386,7 +391,15 @@ pub fn process_genetic<S: ProgressSink>(
     let swaps_per_generation = SWAPS_PER_GENERATION_PER_PIXEL * pixels.len();
 
     let mut max_dist = settings.sidelen;
+    let mut generation = 0u32;
     loop {
+        generation += 1;
+        if generation > 5000 {
+            tx.send(ProgressMsg::Error(
+                "Genetic: exceeded maximum generations without converging".into(),
+            ));
+            return Ok(());
+        }
         let mut swaps_made = 0;
         for _ in 0..swaps_per_generation {
             let apos = rng.gen_range(0..pixels.len() as u32) as usize;
@@ -423,6 +436,15 @@ pub fn process_genetic<S: ProgressSink>(
                 pixels[apos].update_heuristic(b_on_a_h);
                 pixels[bpos].update_heuristic(a_on_b_h);
                 swaps_made += 1;
+                if swaps_made % 5000 == 4999 {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            tx.send(ProgressMsg::Cancelled);
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
 
@@ -452,7 +474,7 @@ pub fn process_genetic<S: ProgressSink>(
                         .flat_map(|(r, g, b)| [*r, *g, *b])
                         .collect(),
                 },
-                assignments: assignments.clone(),
+                assignments,
             }));
             return Ok(());
         }
@@ -470,16 +492,7 @@ pub fn process_genetic<S: ProgressSink>(
     }
 }
 
-// fn serialize_assignments(assignments: Vec<usize>) -> String {
-//     format!(
-//         "[{}]",
-//         assignments
-//             .iter()
-//             .map(|a| a.to_string())
-//             .collect::<Vec<_>>()
-//             .join(",")
-//     )
-// }
+/// Dispatch to the selected algorithm backend (native).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn process<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
@@ -487,20 +500,233 @@ pub fn process<S: ProgressSink>(
     tx: &mut S,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use algorithms::*;
     match settings.algorithm {
         Algorithm::Optimal => process_optimal(unprocessed, settings, tx, cancel),
         Algorithm::Genetic => process_genetic(unprocessed, settings, tx, cancel),
+        Algorithm::JonkerVolgenant => {
+            jonker_volgenant::process_jonker_volgenant(unprocessed, settings, tx, cancel)
+        }
+        Algorithm::Auction => auction::process_auction(unprocessed, settings, tx, cancel),
+        Algorithm::Multiscale => multiscale::process_multiscale(unprocessed, settings, tx, cancel),
+        Algorithm::Sinkhorn => sinkhorn::process_sinkhorn(unprocessed, settings, tx, cancel),
+        Algorithm::PatchMatch => patchmatch::process_patchmatch(unprocessed, settings, tx, cancel),
+        Algorithm::Fast => modes::process_fast(unprocessed, settings, tx, cancel),
+        Algorithm::Balanced => modes::process_balanced(unprocessed, settings, tx, cancel),
+        Algorithm::Maximum => modes::process_maximum(unprocessed, settings, tx, cancel),
     }
 }
 
+/// Dispatch to the selected algorithm backend (WASM, no cancel flag).
 #[cfg(target_arch = "wasm32")]
 pub fn process<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use algorithms::*;
     match settings.algorithm {
         Algorithm::Optimal => process_optimal(unprocessed, settings, tx),
         Algorithm::Genetic => process_genetic(unprocessed, settings, tx),
+        Algorithm::JonkerVolgenant => {
+            jonker_volgenant::process_jonker_volgenant(unprocessed, settings, tx)
+        }
+        Algorithm::Auction => auction::process_auction(unprocessed, settings, tx),
+        Algorithm::Multiscale => multiscale::process_multiscale(unprocessed, settings, tx),
+        Algorithm::Sinkhorn => sinkhorn::process_sinkhorn(unprocessed, settings, tx),
+        Algorithm::PatchMatch => patchmatch::process_patchmatch(unprocessed, settings, tx),
+        Algorithm::Fast => modes::process_fast(unprocessed, settings, tx),
+        Algorithm::Balanced => modes::process_balanced(unprocessed, settings, tx),
+        Algorithm::Maximum => modes::process_maximum(unprocessed, settings, tx),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::preset::UnprocessedPreset;
+    use util::GenerationSettings;
+    use uuid::Uuid;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    // --- Tests 1-3: heuristic function ---
+
+    #[test]
+    fn test_heuristic_same_position_same_color_is_zero() {
+        let h = heuristic((5, 5), (5, 5), (100, 100, 100), (100, 100, 100), 255, 13);
+        assert_eq!(h, 0);
+    }
+
+    #[test]
+    fn test_heuristic_color_dominates_with_high_color_weight() {
+        let h_low_weight = heuristic((0, 0), (1, 1), (0, 0, 0), (255, 0, 0), 1, 0);
+        let h_high_weight = heuristic((0, 0), (1, 1), (0, 0, 0), (255, 0, 0), 255, 0);
+        // With higher color weight, the heuristic should be larger.
+        assert!(
+            h_high_weight > h_low_weight,
+            "high color weight {h_high_weight} should be > low {h_low_weight}"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_spatial_is_quadratic_in_spatial_weight() {
+        // heuristic spatial term = (spatial * spatial_weight)^2 = spatial^2 * weight^2
+        // So doubling spatial_weight should quadruple the spatial contribution.
+        let h1 = heuristic((0, 0), (10, 0), (0, 0, 0), (0, 0, 0), 0, 1);
+        let h2 = heuristic((0, 0), (10, 0), (0, 0, 0), (0, 0, 0), 0, 2);
+        // spatial = 100, h1 = (100*1)^2 = 10000, h2 = (100*2)^2 = 40000
+        assert_eq!(h1, 10_000);
+        assert_eq!(h2, 40_000);
+    }
+
+    // --- Helper: build a minimal UnprocessedPreset + GenerationSettings ---
+    fn make_test_preset(sidelen: u32, n: usize) -> (UnprocessedPreset, GenerationSettings) {
+        let source_img: Vec<u8> = (0..n)
+            .flat_map(|i| {
+                let v = (i % 256) as u8;
+                [v, v, v]
+            })
+            .collect();
+        let unprocessed = UnprocessedPreset {
+            name: "test".to_string(),
+            width: sidelen,
+            height: sidelen,
+            source_img,
+        };
+        let mut settings = GenerationSettings::default(Uuid::new_v4(), "test".to_string());
+        settings.sidelen = sidelen;
+        settings.proximity_importance = 0; // avoid spatial dominance in small tests
+        settings.algorithm = Algorithm::Optimal;
+        (unprocessed, settings)
+    }
+
+    fn msg_type(msg: &ProgressMsg) -> &'static str {
+        match msg {
+            ProgressMsg::Progress(_) => "progress",
+            ProgressMsg::UpdatePreview { .. } => "update_preview",
+            ProgressMsg::UpdateAssignments(_) => "update_assignments",
+            ProgressMsg::Done(_) => "done",
+            ProgressMsg::Error(_) => "error",
+            ProgressMsg::Cancelled => "cancelled",
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_process_dispatches_every_algorithm_variant() {
+        for algorithm in Algorithm::ALL {
+            let (unprocessed, mut settings) = make_test_preset(4, 16);
+            settings.algorithm = algorithm;
+            settings.proximity_importance = 1;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut msgs: Vec<ProgressMsg> = Vec::new();
+            let mut sink = |msg: ProgressMsg| {
+                msgs.push(msg);
+            };
+
+            let result = process(unprocessed, settings, &mut sink, cancel);
+            assert!(result.is_ok(), "{} returned an error", algorithm.label());
+            assert!(
+                msgs.iter().any(|m| matches!(m, ProgressMsg::Done(_))),
+                "{} did not emit Done; got {:?}",
+                algorithm.label(),
+                msgs.iter().map(msg_type).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // --- Test 4: process_optimal 4x4 emits Done preset ---
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_process_optimal_4x4_emits_done_preset() {
+        let (unprocessed, mut settings) = make_test_preset(4, 16);
+        settings.algorithm = Algorithm::Optimal;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut msgs: Vec<ProgressMsg> = Vec::new();
+        let mut sink = |msg: ProgressMsg| {
+            msgs.push(msg);
+        };
+        let result = process_optimal(unprocessed, settings, &mut sink, cancel);
+        assert!(result.is_ok(), "process_optimal should succeed");
+        let has_done = msgs.iter().any(|m| matches!(m, ProgressMsg::Done(_)));
+        assert!(
+            has_done,
+            "should emit Done message, got: {:?}",
+            msgs.iter().map(msg_type).collect::<Vec<_>>()
+        );
+    }
+
+    // --- Test 5: process_genetic 2x2 converges to Done ---
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_process_genetic_2x2_converges_to_done() {
+        let (unprocessed, mut settings) = make_test_preset(2, 4);
+        settings.algorithm = Algorithm::Genetic;
+        settings.proximity_importance = 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut msgs: Vec<ProgressMsg> = Vec::new();
+        let mut sink = |msg: ProgressMsg| {
+            msgs.push(msg);
+        };
+        let result = process_genetic(unprocessed, settings, &mut sink, cancel);
+        assert!(result.is_ok());
+        let has_done = msgs.iter().any(|m| matches!(m, ProgressMsg::Done(_)));
+        assert!(has_done, "genetic should converge and emit Done");
+    }
+
+    // --- Test 6: process_genetic emits progress messages ---
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_process_genetic_emits_progress_messages() {
+        let (unprocessed, mut settings) = make_test_preset(4, 16);
+        settings.algorithm = Algorithm::Genetic;
+        settings.proximity_importance = 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut msgs: Vec<ProgressMsg> = Vec::new();
+        let mut sink = |msg: ProgressMsg| {
+            msgs.push(msg);
+        };
+        let result = process_genetic(unprocessed, settings, &mut sink, cancel);
+        assert!(result.is_ok());
+        // Should emit at least one Progress or UpdatePreview message.
+        let has_progress = msgs.iter().any(|m| {
+            matches!(
+                m,
+                ProgressMsg::Progress(_) | ProgressMsg::UpdatePreview { .. }
+            )
+        });
+        assert!(
+            has_progress,
+            "genetic should emit progress messages, got: {:?}",
+            msgs.iter().map(msg_type).collect::<Vec<_>>()
+        );
+    }
+
+    // --- Test 7: make_new_img rearranges pixels ---
+    #[test]
+    fn test_make_new_img_rearranges_pixels() {
+        let source_pixels = vec![(10, 20, 30), (40, 50, 60), (70, 80, 90), (100, 110, 120)];
+        // assignments[dst] = src: dst 0 -> src 1, dst 1 -> src 0, etc.
+        let assignments = vec![1, 0, 3, 2];
+        let img = make_new_img(&source_pixels, &assignments, 2);
+        // dst 0 should get source_pixels[1] = (40, 50, 60)
+        assert_eq!(img[0], 40);
+        assert_eq!(img[1], 50);
+        assert_eq!(img[2], 60);
+        // dst 1 should get source_pixels[0] = (10, 20, 30)
+        assert_eq!(img[3], 10);
+        assert_eq!(img[4], 20);
+        assert_eq!(img[5], 30);
+    }
+
+    // --- Test 8: make_new_img output size matches sidelen ---
+    #[test]
+    fn test_make_new_img_output_size_matches_sidelen() {
+        let source_pixels = vec![(0, 0, 0); 16];
+        let assignments = vec![0; 16];
+        let img = make_new_img(&source_pixels, &assignments, 4);
+        assert_eq!(img.len(), 4 * 4 * 3);
     }
 }

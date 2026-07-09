@@ -1,6 +1,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
+#[cfg(target_arch = "wasm32")]
+use std::{cell::RefCell, rc::Rc};
 
 use color_quant::NeuQuant;
 
@@ -37,6 +39,7 @@ impl GifStatus {
 struct InFlight {
     buffer: wgpu::Buffer,
     ready: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
 }
 
 pub struct GifRecorder {
@@ -47,6 +50,8 @@ pub struct GifRecorder {
     pub frame_count: u32,
     inflight: Option<InFlight>,
     should_stop: bool,
+    #[cfg(target_arch = "wasm32")]
+    pending_status: Rc<RefCell<Option<GifStatus>>>,
 }
 
 impl GifRecorder {
@@ -59,6 +64,8 @@ impl GifRecorder {
             frame_count: 0,
             inflight: None,
             should_stop: false,
+            #[cfg(target_arch = "wasm32")]
+            pending_status: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -70,8 +77,19 @@ impl GifRecorder {
         self.status.not_recording()
     }
 
-    fn poll_inflight(&mut self) -> Option<Vec<u8>> {
+    pub fn apply_pending_status(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(status) = self.pending_status.borrow_mut().take() {
+            self.status = status;
+        }
+    }
+
+    fn poll_inflight(&mut self) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
         if let Some(inflight) = &self.inflight {
+            if let Some(error) = inflight.error.lock().ok().and_then(|mut err| err.take()) {
+                self.inflight = None;
+                return Err(error.into());
+            }
             if inflight.ready.load(std::sync::atomic::Ordering::Acquire) {
                 let slice = inflight.buffer.slice(..);
                 let mapped = slice.get_mapped_range();
@@ -92,23 +110,28 @@ impl GifRecorder {
                 drop(mapped);
                 inflight.buffer.unmap();
                 self.inflight = None;
-                Some(rgba)
+                Ok(Some(rgba))
             } else {
-                None
+                Ok(None)
             }
         } else {
-            None
+            Ok(None)
         }
     }
 
     pub fn try_write_frame(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
-        if let Some(rgba) = self.poll_inflight() {
+        if let Some(rgba) = self.poll_inflight()? {
             if let Some(encoder) = &mut self.encoder {
-                let nq = self.palette.as_ref().unwrap();
-                let pixels: Vec<u8> = rgba
-                    .chunks_exact(4)
-                    .map(|pix| nq.index_of(pix) as u8)
-                    .collect();
+                let Some(nq) = self.palette.as_ref() else {
+                    return Err("No GIF palette".into());
+                };
+                let pixels: Vec<u8> = {
+                    let mut p = Vec::with_capacity(rgba.len() / 4);
+                    for pix in rgba.chunks_exact(4) {
+                        p.push(nq.index_of(pix) as u8);
+                    }
+                    p
+                };
                 let mut frame = gif::Frame::from_indexed_pixels(
                     GIF_RESOLUTION as u16,
                     GIF_RESOLUTION as u16,
@@ -126,8 +149,7 @@ impl GifRecorder {
 
                 Ok(true)
             } else {
-                // shouldn't happen
-                Err("No encoder".into())
+                Err("encoder was None during try_write_frame".into())
             }
         } else {
             Ok(false)
@@ -157,14 +179,18 @@ impl GifRecorder {
         self.encoder = Some(encoder);
         self.frame_count = 0;
         self.status = GifStatus::Recording;
+        self.should_stop = false;
         Ok(())
     }
 
     pub fn finish(&mut self, name: String) -> bool {
-        match (
-            self.status.clone(),
-            self.encoder.take().unwrap().into_inner(),
-        ) {
+        let Some(encoder) = self.encoder.take() else {
+            self.status = GifStatus::Error(String::from("No encoder"));
+            return true;
+        };
+        self.should_stop = false;
+
+        match (self.status.clone(), encoder.into_inner()) {
             (GifStatus::Recording, Ok(data)) => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -174,8 +200,13 @@ impl GifRecorder {
                         .set_file_name(format!("{}.gif", name))
                         .save_file();
                     if let Some(path) = file {
-                        std::fs::write(&path, data).unwrap();
-                        self.status = GifStatus::Complete(path);
+                        match std::fs::write(&path, data) {
+                            Ok(()) => self.status = GifStatus::Complete(path),
+                            Err(err) => {
+                                self.status =
+                                    GifStatus::Error(format!("failed to save gif: {err}"));
+                            }
+                        }
                     } else {
                         return false;
                     }
@@ -184,7 +215,7 @@ impl GifRecorder {
                 {
                     self.status = GifStatus::None;
                     use wasm_bindgen_futures::spawn_local;
-                    let status_ptr: *mut GifStatus = &mut self.status;
+                    let pending_status = Rc::clone(&self.pending_status);
 
                     spawn_local(async move {
                         if let Some(handle) = rfd::AsyncFileDialog::new()
@@ -193,10 +224,13 @@ impl GifRecorder {
                             .save_file()
                             .await
                         {
-                            handle.write(&data).await.ok();
-                            // SAFETY: We ensure the app outlives the async task (eframe app is long-lived).
-                            unsafe {
-                                *status_ptr = GifStatus::Complete;
+                            match handle.write(&data).await {
+                                Ok(()) => *pending_status.borrow_mut() = Some(GifStatus::Complete),
+                                Err(err) => {
+                                    *pending_status.borrow_mut() = Some(GifStatus::Error(format!(
+                                        "failed to save gif: {err:?}"
+                                    )));
+                                }
                             }
                         }
                     });
@@ -214,6 +248,7 @@ impl GifRecorder {
     }
 
     pub fn stop(&mut self) {
+        self.should_stop = false;
         self.status = GifStatus::None;
         self.encoder = None;
         self.palette = None;
@@ -232,7 +267,7 @@ impl GifRecorder {
         }
     }
 
-    pub(crate) fn get_name(&self, name: String, reverse: bool) -> String {
+    pub(crate) fn get_name(&self, name: &str, reverse: bool) -> String {
         if reverse {
             format!("unobamify_{}", name)
         } else {
@@ -242,6 +277,12 @@ impl GifRecorder {
 }
 
 impl ObamifyApp {
+    /// Starts an asynchronous readback of the current rendered image for GIF encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GPU readback setup fails before the asynchronous map
+    /// operation is queued. Later map failures are reported by `try_write_frame`.
     pub fn get_color_image_data(
         &mut self,
         device: &wgpu::Device,
@@ -293,45 +334,26 @@ impl ObamifyApp {
         queue.submit(Some(encoder.finish()));
 
         let ready = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
         let slice = readback.slice(..);
         let ready_in_cb = Arc::clone(&ready);
+        let error_in_cb = Arc::clone(&error);
 
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            if res.is_ok() {
-                ready_in_cb.store(true, std::sync::atomic::Ordering::Release);
+        slice.map_async(wgpu::MapMode::Read, move |res| match res {
+            Ok(()) => ready_in_cb.store(true, std::sync::atomic::Ordering::Release),
+            Err(err) => {
+                if let Ok(mut error) = error_in_cb.lock() {
+                    *error = Some(format!("failed to map GIF readback buffer: {err}"));
+                }
             }
         });
 
         self.gif_recorder.inflight = Some(InFlight {
             buffer: readback,
             ready,
+            error,
         });
 
         Ok(())
-
-        // let slice = readback.slice(..);
-        // let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-
-        // slice.map_async(wgpu::MapMode::Read, move |res| {
-        //     // res: Result<(), wgpu::BufferAsyncError>
-        //     let _ = tx.send(res);
-        // });
-
-        // // Ensure the callback runs
-        // device.poll(wgpu::PollType::Wait)?;
-
-        // // Wait for the result and propagate any map error
-        // pollster::block_on(rx.receive()).expect("map_async sender dropped")?;
-        // let mapped = slice.get_mapped_range();
-        // // Remove row padding
-        // let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-        // for y in 0..height as usize {
-        //     let start = y * padded_bytes_per_row as usize;
-        //     let end = start + unpadded_bytes_per_row as usize;
-        //     rgba.extend_from_slice(&mapped[start..end]);
-        // }
-        // drop(mapped);
-        // readback.unmap();
-        // Ok(rgba)
     }
 }

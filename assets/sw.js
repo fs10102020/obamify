@@ -1,20 +1,86 @@
-var cacheName = "obamify-pwa"
-var filesToCache = [] //["./", "./index.html", "./obamify.js", "./obamify_bg.wasm"]
+var CACHE_NAME = "obamify-pwa-v2"
 
-/* Start the service worker and cache all of the app's content */
+var filesToCache = [
+    "./",
+    "./index.html",
+    "./manifest.json",
+    "./worker.js",
+]
+
+function isNavigation(request) {
+    return request.mode === "navigate"
+}
+
+function isSameOrigin(url) {
+    return url.origin === self.location.origin
+}
+
+// Install: precache core app shell — let errors fail the install
 self.addEventListener("install", function (e) {
     e.waitUntil(
-        caches.open(cacheName).then(function (cache) {
+        caches.open(CACHE_NAME).then(function (cache) {
             return cache.addAll(filesToCache)
         })
     )
 })
 
-/* Serve cached content when offline */
-self.addEventListener("fetch", function (e) {
-    e.respondWith(
-        caches.match(e.request).then(function (response) {
-            return response || fetch(e.request)
+// Activate: delete only old obamify-pwa-* caches
+self.addEventListener("activate", function (e) {
+    e.waitUntil(
+        caches.keys().then(function (names) {
+            return Promise.all(
+                names.filter(function (name) {
+                    return name.startsWith("obamify-pwa-") && name !== CACHE_NAME
+                }).map(function (name) {
+                    return caches.delete(name)
+                })
+            )
         })
     )
 })
+
+// Fetch: network-first for navigations, cache-first for other same-origin GETs
+self.addEventListener("fetch", function (e) {
+    var url = new URL(e.request.url)
+
+    if (e.request.method !== "GET" || !isSameOrigin(url)) {
+        return
+    }
+
+    if (isNavigation(e.request)) {
+        e.respondWith(networkFirst(e.request))
+    } else {
+        e.respondWith(cacheFirst(e.request))
+    }
+})
+
+function networkFirst(request) {
+    return fetch(request).then(function (response) {
+        if (response && response.status === 200) {
+            var clone = response.clone()
+            caches.open(CACHE_NAME).then(function (cache) {
+                cache.put(request, clone)
+            })
+        }
+        return response
+    }).catch(function () {
+        return caches.match(request)
+    })
+}
+
+function cacheFirst(request) {
+    return caches.match(request).then(function (cached) {
+        if (cached) {
+            return cached
+        }
+        return fetch(request).then(function (response) {
+            if (response && response.status === 200) {
+                var clone = response.clone()
+                caches.open(CACHE_NAME).then(function (cache) {
+                    cache.put(request, clone)
+                })
+            }
+            return response
+        })
+    })
+}

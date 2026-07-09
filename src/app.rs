@@ -20,7 +20,6 @@ use std::sync::atomic::AtomicU32;
 use bytemuck::{Pod, Zeroable};
 use eframe::CreationContext;
 use egui_wgpu::{self, wgpu};
-#[cfg(not(target_arch = "wasm32"))]
 use uuid::Uuid;
 use wgpu::util::DeviceExt;
 
@@ -61,14 +60,17 @@ const DEFAULT_RESOLUTION: u32 = 2048;
 #[cfg(target_arch = "wasm32")]
 const DEFAULT_RESOLUTION: u32 = 1024;
 
+/// Top-level GUI mode: image transformation or free drawing.
 pub enum GuiMode {
     Transform,
-    #[cfg(not(target_arch = "wasm32"))]
     Draw,
 }
 
 use crate::app::{calculate::ProgressMsg, morph_sim::Sim, preset::UnprocessedPreset};
 use crate::app::{calculate::util::GenerationSettings, preset::Preset};
+
+#[cfg(target_arch = "wasm32")]
+use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::closure::Closure;
@@ -77,6 +79,7 @@ use wasm_bindgen::{JsCast, JsValue};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{Worker, WorkerOptions, WorkerType, js_sys};
 
+/// Interactive obamify application state and renderer resources.
 pub struct ObamifyApp {
     //prev_frame_time: std::time::Instant,
     // UI state
@@ -92,7 +95,10 @@ pub struct ObamifyApp {
     worker: Option<Worker>,
 
     #[cfg(target_arch = "wasm32")]
-    inbox: Vec<ProgressMsg>,
+    inbox: Rc<RefCell<VecDeque<ProgressMsg>>>,
+
+    #[cfg(target_arch = "wasm32")]
+    pending_images: Rc<RefCell<VecDeque<gui::PendingImageResult>>>,
 
     gif_recorder: gif_recorder::GifRecorder,
     sim: Sim,
@@ -101,16 +107,14 @@ pub struct ObamifyApp {
     seeds: Vec<SeedPos>,
     colors: Arc<RwLock<Vec<SeedColor>>>,
 
-    #[cfg(not(target_arch = "wasm32"))]
     pixeldata: Arc<RwLock<Vec<calculate::drawing_process::PixelData>>>,
+    #[cfg(target_arch = "wasm32")]
+    drawing_optimizer: Option<calculate::drawing_process::DrawingOptimizer>,
 
     // EGUI texture id for presenting the shaded RGBA texture
     egui_tex_id: Option<egui::TextureId>,
 
     // GPU resources (lifetime tied to eframe's RenderState device)
-    // Buffers
-    seed_buf: wgpu::Buffer,
-    color_buf: wgpu::Buffer,
     params_common_buf: wgpu::Buffer,
     params_jfa_buf: wgpu::Buffer,
 
@@ -130,13 +134,11 @@ pub struct ObamifyApp {
     color_view: wgpu::TextureView,
 
     // Pipelines
-    clear_pipeline: wgpu::RenderPipeline,
     seed_splat_pipeline: wgpu::RenderPipeline,
     jfa_pipeline: wgpu::RenderPipeline,
     shade_pipeline: wgpu::RenderPipeline,
 
     // Bind group layouts
-    clear_bgl: wgpu::BindGroupLayout,
     seed_bgl: wgpu::BindGroupLayout,
     jfa_bgl: wgpu::BindGroupLayout,
     shade_bgl: wgpu::BindGroupLayout,
@@ -145,14 +147,12 @@ pub struct ObamifyApp {
     nearest_sampler: wgpu::Sampler,
 
     // Bind groups that are re-created when textures change
-    clear_bg_a: wgpu::BindGroup,
-    clear_bg_b: wgpu::BindGroup,
     seed_bg: wgpu::BindGroup,
     jfa_bg_a_to_b: wgpu::BindGroup,
     jfa_bg_b_to_a: wgpu::BindGroup,
     shade_bg: wgpu::BindGroup,
+    shade_bg_b: wgpu::BindGroup,
     preview_image: Option<image::ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
-    #[cfg(not(target_arch = "wasm32"))]
     stroke_count: u32,
 
     frame_count: u32,
@@ -179,13 +179,6 @@ impl ObamifyApp {
         self.seeds = seeds;
         self.sim = sim;
 
-        // Update GPU buffers
-        self.seed_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("seeds"),
-            contents: bytemuck::cast_slice(&self.seeds),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
         // Update seed texture (WebGL compatible)
         let (seed_tex, seed_tex_view) =
             Self::make_seed_texture(device, queue, &self.seeds, self.seed_count);
@@ -204,28 +197,24 @@ impl ObamifyApp {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        self.color_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("colors"),
-            contents: bytemuck::cast_slice(&colors),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
         // Update color lookup texture (WebGL compatible)
         let (color_lookup_tex, color_lookup_tex_view) =
             Self::make_color_lookup_texture(device, queue, &colors, self.seed_count);
         self.color_lookup_tex = color_lookup_tex;
         self.color_lookup_tex_view = color_lookup_tex_view;
 
-        *self.colors.write().unwrap() = colors;
-        #[cfg(not(target_arch = "wasm32"))]
+        *self.colors.write().unwrap_or_else(|e| e.into_inner()) = colors;
+        *self.pixeldata.write().unwrap_or_else(|e| e.into_inner()) =
+            calculate::drawing_process::PixelData::init_canvas();
+        #[cfg(target_arch = "wasm32")]
         {
-            *self.pixeldata.write().unwrap() =
-                calculate::drawing_process::PixelData::init_canvas(self.frame_count);
+            self.drawing_optimizer = None;
         }
 
         self.rebuild_bind_groups(device);
     }
 
+    /// Replaces the active simulation with a saved preset.
     pub fn change_sim(
         &mut self,
         device: &wgpu::Device,
@@ -239,7 +228,7 @@ impl ObamifyApp {
         self.gui.current_preset = change_index;
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Replaces the active simulation with a drawing canvas source.
     pub fn canvas_sim(
         &mut self,
         device: &wgpu::Device,
@@ -250,6 +239,12 @@ impl ObamifyApp {
         self.apply_sim_init(device, queue, seed_count, seeds, colors, sim);
     }
 
+    /// Creates an application instance from an `eframe` creation context.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the app was not started with the `wgpu` renderer, or if the
+    /// built-in preset/image assets are invalid.
     pub fn new(cc: &CreationContext<'_>) -> Self {
         let rs = cc
             .wgpu_render_state
@@ -258,11 +253,12 @@ impl ObamifyApp {
             .clone();
         let device = &rs.device;
         let size = (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION);
-        egui_extras::install_image_loaders(&cc.egui_ctx);
 
         // get all folders in ../presets
         let presets: Vec<Preset> = if let Some(storage) = cc.storage {
-            eframe::get_value(storage, "presets").unwrap_or(get_presets())
+            eframe::get_value::<Vec<Preset>>(storage, "presets")
+                .filter(|p| validate_presets(p))
+                .unwrap_or_else(get_presets)
         } else {
             get_presets()
         };
@@ -284,19 +280,6 @@ impl ObamifyApp {
 
         let (seed_count, seeds, colors, sim) =
             morph_sim::init_image(size.0, presets[random_preset].clone());
-
-        // === Buffers ===
-        let seed_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("seeds"),
-            contents: bytemuck::cast_slice(&seeds),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let color_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("colors"),
-            contents: bytemuck::cast_slice(&colors),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
 
         // Create textures for WebGL compatibility (no storage buffers in shaders)
         let (seed_tex, seed_tex_view) =
@@ -334,11 +317,6 @@ impl ObamifyApp {
         let (color_tex, color_view) = Self::make_color_texture(device, size, Some("color"));
 
         // === Pipelines ===
-        let clear_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bgl_clear"),
-            entries: &[],
-        });
-
         let seed_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bgl_seed_splat"),
             entries: &[
@@ -487,10 +465,6 @@ impl ObamifyApp {
         });
 
         // Shader modules
-        let clear_sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("clear.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/clear.wgsl").into()),
-        });
         let seed_sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("seed_splat.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/seed.wgsl").into()),
@@ -505,41 +479,6 @@ impl ObamifyApp {
         });
 
         // Pipelines
-        let clear_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("clear_pipeline"),
-            layout: Some(
-                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("pl_clear"),
-                    bind_group_layouts: &[&clear_bgl],
-                    push_constant_ranges: &[],
-                }),
-            ),
-            vertex: wgpu::VertexState {
-                module: &clear_sm,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &clear_sm,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
         let seed_splat_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("seed_splat_pipeline"),
             layout: Some(
@@ -646,17 +585,6 @@ impl ObamifyApp {
         });
 
         // Bind groups
-        let clear_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bg_clear_a"),
-            layout: &clear_bgl,
-            entries: &[],
-        });
-        let clear_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bg_clear_b"),
-            layout: &clear_bgl,
-            entries: &[],
-        });
-
         let seed_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg_seed_splat"),
             layout: &seed_bgl,
@@ -745,6 +673,33 @@ impl ObamifyApp {
             ],
         });
 
+        let shade_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg_shade_b"),
+            layout: &shade_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&ids_b_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&nearest_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&seed_tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&color_lookup_tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_common_buf.as_entire_binding(),
+                },
+            ],
+        });
+
         #[cfg(not(target_arch = "wasm32"))]
         let (progress_tx, progress_rx) = mpsc::sync_channel::<ProgressMsg>(1);
 
@@ -754,13 +709,12 @@ impl ObamifyApp {
 
             seeds,
             colors: Arc::new(RwLock::new(colors)),
-            #[cfg(not(target_arch = "wasm32"))]
             pixeldata: Arc::new(RwLock::new(
-                calculate::drawing_process::PixelData::init_canvas(0),
+                calculate::drawing_process::PixelData::init_canvas(),
             )),
+            #[cfg(target_arch = "wasm32")]
+            drawing_optimizer: None,
             egui_tex_id: None,
-            seed_buf,
-            color_buf,
             sim,
             params_common_buf,
             params_jfa_buf,
@@ -774,21 +728,18 @@ impl ObamifyApp {
             ids_b_view,
             color_tex,
             color_view,
-            clear_pipeline,
             seed_splat_pipeline,
             jfa_pipeline,
             shade_pipeline,
-            clear_bgl,
             seed_bgl,
             jfa_bgl,
             shade_bgl,
             nearest_sampler,
-            clear_bg_a,
-            clear_bg_b,
             seed_bg,
             jfa_bg_a_to_b,
             jfa_bg_b_to_a,
             shade_bg,
+            shade_bg_b,
             //prev_frame_time: std::time::Instant::now(),
             #[cfg(not(target_arch = "wasm32"))]
             progress_tx,
@@ -796,7 +747,6 @@ impl ObamifyApp {
             progress_rx,
             gif_recorder: gif_recorder::GifRecorder::new(),
             preview_image: None,
-            #[cfg(not(target_arch = "wasm32"))]
             stroke_count: 0,
             gui: gui::GuiState::default(presets, random_preset, has_obamified_once),
             frame_count: 0,
@@ -805,17 +755,20 @@ impl ObamifyApp {
             #[cfg(target_arch = "wasm32")]
             worker: None,
             #[cfg(target_arch = "wasm32")]
-            inbox: Vec::new(),
+            inbox: Rc::new(RefCell::new(VecDeque::new())),
+            #[cfg(target_arch = "wasm32")]
+            pending_images: Rc::new(RefCell::new(VecDeque::new())),
             current_filter_mode: wgpu::FilterMode::Linear,
 
             reverse: false,
         }
     }
 
+    /// Returns the latest background processing message, if one is available.
     pub fn get_latest_msg(&mut self) -> Option<ProgressMsg> {
         #[cfg(target_arch = "wasm32")]
         {
-            self.inbox.pop()
+            self.inbox.borrow_mut().pop_front()
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -831,10 +784,26 @@ impl ObamifyApp {
     }
 
     #[cfg(target_arch = "wasm32")]
+    /// Advances the WASM drawing optimizer within a per-frame budget.
+    pub fn advance_drawing_optimizer(&mut self) {
+        let Some(mut optimizer) = self.drawing_optimizer.take() else {
+            return;
+        };
+        let colors = self.colors.read().unwrap_or_else(|e| e.into_inner());
+        let pixel_data = self.pixeldata.read().unwrap_or_else(|e| e.into_inner());
+        let swap_budget = ((self.seed_count as usize) / 4).clamp(1024, 8192);
+        if let Some(assignments) = optimizer.step(&colors, &pixel_data, swap_budget) {
+            self.sim.set_assignments(assignments, self.size.0);
+        }
+        self.drawing_optimizer = Some(optimizer);
+    }
+
+    #[cfg(target_arch = "wasm32")]
     fn ensure_worker(&mut self, _ctx: &egui::Context) {
         if self.worker.is_some() {
             return;
         }
+        let inbox = Rc::clone(&self.inbox);
 
         let worker = {
             let wasm_script_src = js_sys::Reflect::get(
@@ -868,19 +837,34 @@ impl ObamifyApp {
 
             let opts = WorkerOptions::new();
             opts.set_type(WorkerType::Module);
-            let w = Worker::new_with_options(&worker_url, &opts).expect("worker");
+            let w = match Worker::new_with_options(&worker_url, &opts) {
+                Ok(w) => w,
+                Err(e) => {
+                    inbox.borrow_mut().push_back(ProgressMsg::Error(format!(
+                        "failed to create worker: {e:?}"
+                    )));
+                    return;
+                }
+            };
 
             // ---- onerror: may be ErrorEvent OR a generic Event/JsValue ----
+            let error_inbox = Rc::clone(&inbox);
             let onerror = Closure::wrap(Box::new(move |e: JsValue| {
+                let mut message = String::from("worker error");
                 if let Some(err) = e.dyn_ref::<web_sys::ErrorEvent>() {
                     // Safe: has .message()
                     web_sys::console::error_2(&"worker error:".into(), &err.message().into());
+                    message = format!("worker error: {}", err.message());
                     // (Optional) filenames/lineno may be empty on module workers:
                     // web_sys::console::error_3(&"at".into(), &err.filename().into(), &err.lineno().into());
                 } else if let Some(ev) = e.dyn_ref::<web_sys::Event>() {
                     // No message property
                     let ty = ev.type_();
-                    web_sys::console::error_2(&"worker error (generic Event):".into(), &ty.into());
+                    web_sys::console::error_2(
+                        &"worker error (generic Event):".into(),
+                        &ty.clone().into(),
+                    );
+                    message = format!("worker error: {ty}");
                 } else {
                     // Something else (could even be undefined/null)
                     web_sys::console::error_1(&JsValue::from_str(&format!(
@@ -888,24 +872,29 @@ impl ObamifyApp {
                         js_sys::JSON::stringify(&e).ok()
                     )));
                 }
+                error_inbox
+                    .borrow_mut()
+                    .push_back(ProgressMsg::Error(message));
             }) as Box<dyn FnMut(JsValue)>);
             // set_onerror takes a Function; unchecked_ref is fine here
             w.set_onerror(Some(onerror.as_ref().unchecked_ref()));
             onerror.forget();
 
             // ---- onmessageerror: data failed to deserialize ----
+            let message_error_inbox = Rc::clone(&inbox);
             let onmsgerr = Closure::wrap(Box::new(move |e: JsValue| {
-                if let Some(me) = e.dyn_ref::<web_sys::MessageEvent>() {
+                let message = if let Some(me) = e.dyn_ref::<web_sys::MessageEvent>() {
                     web_sys::console::error_2(&"worker messageerror; data:".into(), &me.data());
+                    String::from("worker message error")
                 } else {
                     web_sys::console::error_1(&"worker messageerror (unknown payload)".into());
-                }
+                    String::from("worker message error: unknown payload")
+                };
+                message_error_inbox
+                    .borrow_mut()
+                    .push_back(ProgressMsg::Error(message));
             }) as Box<dyn FnMut(JsValue)>);
-            // Older web-sys may not have set_onmessageerror; ignore if missing
-            #[allow(unused_must_use)]
-            {
-                w.set_onmessageerror(Some(onmsgerr.as_ref().unchecked_ref()));
-            }
+            w.set_onmessageerror(Some(onmsgerr.as_ref().unchecked_ref()));
             onmsgerr.forget();
 
             w
@@ -915,13 +904,10 @@ impl ObamifyApp {
 
         // Receive progress messages
         {
-            let inbox_ptr: *mut Vec<ProgressMsg> = &mut self.inbox;
+            let message_inbox = Rc::clone(&inbox);
             let onmessage = Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
                 if let Ok(msg) = serde_wasm_bindgen::from_value::<ProgressMsg>(e.data()) {
-                    // SAFETY: single-threaded; worker posts to main thread
-                    unsafe {
-                        (*inbox_ptr).push(msg);
-                    }
+                    message_inbox.borrow_mut().push_back(msg);
                 }
             }) as Box<dyn FnMut(_)>);
             worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
@@ -933,13 +919,29 @@ impl ObamifyApp {
 
     #[cfg(target_arch = "wasm32")]
     fn start_job(&mut self, src: UnprocessedPreset, settings: GenerationSettings) {
+        self.inbox.borrow_mut().clear();
         if let Some(w) = &self.worker {
-            let req = calculate::worker::WorkerReq::Process {
+            let req = calculate::worker::WorkerReq {
                 source: src,
                 settings,
             };
-            let v = serde_wasm_bindgen::to_value(&req).unwrap();
-            w.post_message(&v).unwrap();
+            let v = match serde_wasm_bindgen::to_value(&req) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.inbox
+                        .borrow_mut()
+                        .push_back(ProgressMsg::Error(format!("serialization error: {e}")));
+                    return;
+                }
+            };
+            match w.post_message(&v) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.inbox
+                        .borrow_mut()
+                        .push_back(ProgressMsg::Error(format!("postMessage failed: {e:?}")));
+                }
+            }
         }
     }
 
@@ -1167,16 +1169,6 @@ impl ObamifyApp {
 
     fn rebuild_bind_groups(&mut self, device: &wgpu::Device) {
         // Rebuild any BGs that reference texture views
-        self.clear_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bg_clear_a"),
-            layout: &self.clear_bgl,
-            entries: &[],
-        });
-        self.clear_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bg_clear_b"),
-            layout: &self.clear_bgl,
-            entries: &[],
-        });
         self.seed_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg_seed_splat"),
             layout: &self.seed_bgl,
@@ -1261,9 +1253,35 @@ impl ObamifyApp {
                 },
             ],
         });
+        self.shade_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg_shade_b"),
+            layout: &self.shade_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.ids_b_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.seed_tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.color_lookup_tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.params_common_buf.as_entire_binding(),
+                },
+            ],
+        });
     }
 
-    fn resize_textures(&mut self, device: &wgpu::Device, new_size: (u32, u32), rebuild_bg: bool) {
+    fn resize_textures(&mut self, device: &wgpu::Device, new_size: (u32, u32)) {
         self.size = new_size;
         // Recreate textures
         let (ids_a, ids_a_view) = Self::make_ids_texture(device, self.size, Some("ids_a"));
@@ -1301,10 +1319,6 @@ impl ObamifyApp {
             contents: bytemuck::bytes_of(&params_jfa),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        if rebuild_bg {
-            self.rebuild_bind_groups(device);
-        }
-
         // Force re-registering the egui texture
         self.egui_tex_id = None;
     }
@@ -1319,7 +1333,7 @@ impl ObamifyApp {
 
         // 1) Clear ID texture A (where we'll splat seeds)
         {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear_ids_a"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.ids_a_view,
@@ -1333,9 +1347,6 @@ impl ObamifyApp {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            rpass.set_pipeline(&self.clear_pipeline);
-            rpass.set_bind_group(0, &self.clear_bg_a, &[]);
-            rpass.draw(0..4, 0..1);
         }
 
         // 2) Seed splat into A
@@ -1432,78 +1443,11 @@ impl ObamifyApp {
             step >>= 1;
         }
 
-        // if self.refined {
-        //     for _ in 0..2 {
-        //         let pj = ParamsJfa {
-        //             width: self.size.0,
-        //             height: self.size.1,
-        //             step: 1,
-        //             _pad: 0,
-        //         };
-        //         let staging = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        //             label: Some("params_jfa_staging"),
-        //             contents: bytemuck::bytes_of(&pj),
-        //             usage: wgpu::BufferUsages::COPY_SRC,
-        //         });
-        //         encoder.copy_buffer_to_buffer(
-        //             &staging,
-        //             0,
-        //             &self.params_jfa_buf,
-        //             0,
-        //             std::mem::size_of::<ParamsJfa>() as u64,
-        //         );
-        //         {
-        //             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        //                 label: Some("jfa_step"),
-        //                 timestamp_writes: None,
-        //             });
-        //             cpass.set_pipeline(&self.jfa_pipeline);
-        //             cpass.set_bind_group(
-        //                 0,
-        //                 if !flip {
-        //                     &self.jfa_bg_a_to_b
-        //                 } else {
-        //                     &self.jfa_bg_b_to_a
-        //                 },
-        //                 &[],
-        //             );
-        //             cpass.dispatch_workgroups(groups_x, groups_y, 1);
-        //         }
-        //         flip = !flip;
-        //     }
-        // }
-
         // 4) Shade to color (the final IDs are in A if flip is true, else in B).
         // Our shade BG was built with ids_a_view at binding 0. If the last write ended in B,
-        // we temporarily rebind with B for this dispatch.
-        let shade_with_b = flip; // if true, IDs live in B
-        if shade_with_b {
-            let tmp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("bg_shade_tmp_b"),
-                layout: &self.shade_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.ids_b_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&self.seed_tex_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&self.color_lookup_tex_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: self.params_common_buf.as_entire_binding(),
-                    },
-                ],
-            });
+        // we use the pre-built shade_bg_b bind group for this dispatch.
+        let shade_with_b = flip;
+        {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shade"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1519,25 +1463,15 @@ impl ObamifyApp {
                 occlusion_query_set: None,
             });
             rpass.set_pipeline(&self.shade_pipeline);
-            rpass.set_bind_group(0, &tmp_bg, &[]);
-            rpass.draw(0..4, 0..1);
-        } else {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("shade"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            rpass.set_pipeline(&self.shade_pipeline);
-            rpass.set_bind_group(0, &self.shade_bg, &[]);
+            rpass.set_bind_group(
+                0,
+                if shade_with_b {
+                    &self.shade_bg_b
+                } else {
+                    &self.shade_bg
+                },
+                &[],
+            );
             rpass.draw(0..4, 0..1);
         }
 
@@ -1548,7 +1482,7 @@ impl ObamifyApp {
     fn stop_recording_gif(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.gif_recorder.stop();
         self.gui.animate = false;
-        self.resize_textures(device, (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION), false);
+        self.resize_textures(device, (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION));
         self.reset_sim(device, queue);
     }
 
@@ -1561,12 +1495,10 @@ impl ObamifyApp {
         );
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn draw(
         &mut self,
         last_mouse_pos: Option<(f32, f32)>,
         mousepos: (f32, f32),
-        device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
         let stroke_id = if last_mouse_pos.is_some() {
@@ -1604,7 +1536,7 @@ impl ObamifyApp {
                 let alpha =
                     ((thickness + transition - dist) / transition).clamp(0.0, 1.0) * color[3];
                 let blend = |c1: f32, c2: f32, a: f32| (1.0 - a) * c1 + a * c2;
-                let mut colors = self.colors.write().unwrap();
+                let mut colors = self.colors.write().unwrap_or_else(|e| e.into_inner());
                 (*colors)[i].rgba[0] = blend((*colors)[i].rgba[0], color[0], alpha);
                 (*colors)[i].rgba[1] = blend((*colors)[i].rgba[1], color[1], alpha);
                 (*colors)[i].rgba[2] = blend((*colors)[i].rgba[2], color[2], alpha);
@@ -1612,10 +1544,8 @@ impl ObamifyApp {
                 self.sim.cells[i].set_age(0);
                 self.sim.cells[i].set_dst_force(0.05 + (stroke_id as f32 * 0.004).sqrt());
                 self.sim.cells[i].set_stroke_id(stroke_id);
-                self.pixeldata.write().unwrap()[i] = calculate::drawing_process::PixelData {
-                    stroke_id,
-                    last_edited: self.frame_count,
-                };
+                self.pixeldata.write().unwrap_or_else(|e| e.into_inner())[i] =
+                    calculate::drawing_process::PixelData { stroke_id };
 
                 //self.colors[i].rgba = [0.0, 0.0, 0.0, 1.0];
             }
@@ -1625,7 +1555,7 @@ impl ObamifyApp {
         const TEX_WIDTH: u32 = 1024;
         let tex_height = self.seed_count.div_ceil(TEX_WIDTH);
 
-        let colors = self.colors.read().unwrap();
+        let colors = self.colors.read().unwrap_or_else(|e| e.into_inner());
         let mut data = vec![0.0f32; (TEX_WIDTH * tex_height * 4) as usize];
         for (i, color) in colors.iter().enumerate() {
             data[i * 4] = color.rgba[0];
@@ -1653,20 +1583,11 @@ impl ObamifyApp {
                 depth_or_array_layers: 1,
             },
         );
-
-        // Keep the buffer for backward compatibility if needed elsewhere
-        self.color_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("colors"),
-            contents: bytemuck::cast_slice(&*colors),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn handle_drawing(
         &mut self,
         ctx: &egui::Context,
-        device: &wgpu::Device,
         queue: &wgpu::Queue,
         ui: &mut egui::Ui,
         aspect: f32,
@@ -1689,7 +1610,7 @@ impl ObamifyApp {
                     && img_y < self.size.1 as f32
                     && ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
                 {
-                    self.draw(self.gui.last_mouse_pos, (img_x, img_y), device, queue);
+                    self.draw(self.gui.last_mouse_pos, (img_x, img_y), queue);
                     self.gui.last_mouse_pos = Some((img_x, img_y));
                 } else {
                     self.gui.last_mouse_pos = None;
@@ -1702,11 +1623,10 @@ impl ObamifyApp {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn init_canvas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let blank = image::load_from_memory(include_bytes!("./app/calculate/blank.png"))
             .unwrap()
-            .to_rgba8();
+            .to_rgb8();
 
         let settings = GenerationSettings::default(Uuid::new_v4(), "canvas".to_string());
         let source = UnprocessedPreset {
@@ -1718,64 +1638,95 @@ impl ObamifyApp {
         self.canvas_sim(device, queue, &source);
         self.gui.animate = true;
 
-        self.current_drawing_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.current_drawing_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        std::thread::spawn({
-            let tx = self.progress_tx.clone();
-            let colors = Arc::clone(&self.colors);
-            let pixel_data = Arc::clone(&self.pixeldata);
-            let frame_count = self.frame_count;
-            let current_id = self.current_drawing_id.clone();
-            let my_id = current_id.load(std::sync::atomic::Ordering::SeqCst);
-            let source = source.clone();
-            move || {
-                let result = calculate::drawing_process::drawing_process_genetic(
-                    source,
-                    settings,
-                    tx.clone(),
-                    colors,
-                    pixel_data,
-                    frame_count,
-                    my_id,
-                    current_id,
-                );
-                match result {
-                    Ok(()) => {}
-                    Err(err) => {
-                        tx.send(ProgressMsg::Error(err.to_string())).ok();
+            std::thread::spawn({
+                let tx = self.progress_tx.clone();
+                let colors = Arc::clone(&self.colors);
+                let pixel_data = Arc::clone(&self.pixeldata);
+                let current_id = self.current_drawing_id.clone();
+                let my_id = current_id.load(std::sync::atomic::Ordering::SeqCst);
+                let source = source.clone();
+                move || {
+                    let result = calculate::drawing_process::drawing_process_genetic(
+                        source,
+                        settings,
+                        tx.clone(),
+                        colors,
+                        pixel_data,
+                        my_id,
+                        current_id,
+                    );
+                    match result {
+                        Ok(()) => {}
+                        Err(err) => {
+                            let _ = tx.send(ProgressMsg::Error(err.to_string()));
+                        }
                     }
                 }
+            });
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let colors = self
+                .colors
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            match calculate::drawing_process::DrawingOptimizer::new(source, settings, &colors) {
+                Ok(optimizer) => self.drawing_optimizer = Some(optimizer),
+                Err(err) => self
+                    .inbox
+                    .borrow_mut()
+                    .push_back(ProgressMsg::Error(err.to_string())),
             }
-        });
+        }
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 const DRAWING_ALPHA: f32 = 0.5;
-#[cfg(not(target_arch = "wasm32"))]
 fn point_to_line_dist(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
     let dx = x1 - x0;
     let dy = y1 - y0;
     if dx == 0.0 && dy == 0.0 {
-        // It's a point not a line segment.
         (px - x0).hypot(py - y0)
     } else {
-        // Calculate the t that minimizes the distance.
-        let t = ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy);
-        if t < 0.0 {
-            // Beyond the 'x0,y0' end of the segment
-            (px - x0).hypot(py - y0)
-        } else if t > 1.0 {
-            // Beyond the 'x1,y1' end of the segment
-            (px - x1).hypot(py - y1)
-        } else {
-            // Projection falls on the segment
-            let proj_x = x0 + t * dx;
-            let proj_y = y0 + t * dy;
-            (px - proj_x).hypot(py - proj_y)
+        let t = (((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        (px - (x0 + t * dx)).hypot(py - (y0 + t * dy))
+    }
+}
+
+fn validate_presets(presets: &[Preset]) -> bool {
+    if presets.is_empty() {
+        return false;
+    }
+    for p in presets {
+        let expected_bytes = p.inner.width as usize * p.inner.height as usize * 3;
+        if p.inner.source_img.len() != expected_bytes {
+            return false;
+        }
+        if p.inner.width != p.inner.height {
+            return false;
+        }
+        let n = (p.inner.width * p.inner.height) as usize;
+        if p.assignments.len() != n {
+            return false;
+        }
+        let mut seen = vec![false; n];
+        for &a in &p.assignments {
+            if a >= n {
+                return false;
+            }
+            if std::mem::replace(&mut seen[a], true) {
+                return false;
+            }
         }
     }
+    true
 }
 
 macro_rules! include_presets {
@@ -1788,7 +1739,7 @@ macro_rules! include_presets {
                         $name,
                         "/source.png"
                     )))
-                    .unwrap()
+                    .expect("preset source.png must be valid")
                     .to_rgb8();
                     Preset {
                         inner: UnprocessedPreset {
@@ -1800,11 +1751,11 @@ macro_rules! include_presets {
                         assignments: include_str!(concat!("../presets/", $name, "/assignments.json"))
                             .to_string()
                             .strip_prefix('[')
-                            .unwrap()
+                            .expect("assignments.json must start with '['")
                             .strip_suffix(']')
-                            .unwrap()
+                            .expect("assignments.json must end with ']'")
                             .split(',')
-                            .map(|s| s.parse().unwrap())
+                            .map(|s| s.parse().expect("assignments.json must contain valid integers"))
                             .collect::<Vec<usize>>(),
                     }
                 }),*
