@@ -11,6 +11,7 @@ pub struct WorkerReq {
 
 use crate::app::calculate::ProgressMsg;
 use crate::app::calculate::process;
+use crate::app::calculate::util::SolverControl;
 
 // thread_local! {
 //     static CANCELLED: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -23,7 +24,12 @@ pub fn worker_entry() {
     let global_for_handler = global.clone();
 
     let handler = Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
-        let req: WorkerReq = match serde_wasm_bindgen::from_value(e.data()) {
+        let data = e.data();
+        let request = js_sys::Reflect::get(&data, &JsValue::from_str("request"))
+            .unwrap_or(JsValue::UNDEFINED);
+        let control =
+            js_sys::Reflect::get(&data, &JsValue::from_str("control")).unwrap_or(JsValue::NULL);
+        let req: WorkerReq = match serde_wasm_bindgen::from_value(request) {
             Ok(v) => v,
             Err(err) => {
                 let _ = global_for_handler.post_message(&match serde_wasm_bindgen::to_value(
@@ -56,7 +62,12 @@ pub fn worker_entry() {
             let _ = global2.post_message(&val);
         };
 
-        if let Err(e) = process(req.source, req.settings, &mut sink) {
+        if let Err(e) = process(
+            req.source,
+            req.settings,
+            &mut sink,
+            SolverControl::from_shared(control),
+        ) {
             sink(ProgressMsg::Error(e.to_string()));
         }
     }) as Box<dyn FnMut(_)>);

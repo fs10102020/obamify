@@ -15,12 +15,8 @@
 //!   [`super::sinkhorn`], and [`super::patchmatch`] as the discrete
 //!   refinement / repair stage.
 
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, atomic::AtomicBool};
-
 use crate::app::calculate::ProgressMsg;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::app::calculate::algorithms::check_cancel;
+use crate::app::calculate::algorithms::checkpoint;
 use crate::app::calculate::algorithms::{
     CostLookup, build_problem, emit_preview, finalize_preset, validate_permutation,
 };
@@ -28,6 +24,7 @@ use crate::app::calculate::algorithms::{
 use crate::app::calculate::algorithms::{assert_valid_permutation, total_cost};
 use crate::app::calculate::util::GenerationSettings;
 use crate::app::calculate::util::ProgressSink;
+use crate::app::calculate::util::SolverControl;
 use crate::app::preset::UnprocessedPreset;
 
 /// Default ε-scaling factor (geometric decay between phases).
@@ -54,18 +51,33 @@ pub const MAX_DENSE_AUCTION_N: usize = 4096;
 /// `epsilon_phases` controls the ε-scaling schedule: the solver runs multiple
 /// phases, each with ε shrinking by `EPSILON_SCALING_FACTOR`. More phases =
 /// higher quality, slower.
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn sparse_auction(
     cost: &CostLookup,
     candidates: &[Vec<usize>],
     initial_prices: Option<&[f64]>,
     epsilon_phases: usize,
 ) -> Vec<usize> {
+    sparse_auction_with_checkpoint(cost, candidates, initial_prices, epsilon_phases, || true)
+        .expect("uncontrolled auction cannot be cancelled")
+}
+
+pub(crate) fn sparse_auction_with_checkpoint<F>(
+    cost: &CostLookup,
+    candidates: &[Vec<usize>],
+    initial_prices: Option<&[f64]>,
+    epsilon_phases: usize,
+    mut checkpoint: F,
+) -> Option<Vec<usize>>
+where
+    F: FnMut() -> bool,
+{
     let n = cost.n_dst();
     if n == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     if n == 1 {
-        return vec![0];
+        return Some(vec![0]);
     }
 
     // Transpose: candidates_by_src[src] = list of targets src can bid on.
@@ -100,6 +112,9 @@ pub fn sparse_auction(
     let phases = epsilon_phases.max(1);
 
     for _phase in 0..phases {
+        if !checkpoint() {
+            return None;
+        }
         let eps = epsilon.max(1.0 / (n as f64 + 1.0));
 
         // Reconsider all bidders at the new ε. Keeping prices carries the
@@ -109,14 +124,17 @@ pub fn sparse_auction(
         assigned_src.fill(usize::MAX);
 
         // Run auction to convergence at this ε.
-        auction_phase(
+        if !auction_phase(
             cost,
             &candidates_by_src,
             &mut prices,
             &mut assigned_dst,
             &mut assigned_src,
             eps,
-        );
+            &mut checkpoint,
+        ) {
+            return None;
+        }
 
         // Decay ε for the next phase.
         epsilon /= EPSILON_SCALING_FACTOR;
@@ -125,18 +143,22 @@ pub fn sparse_auction(
     // Final repair: any unassigned targets get filled with unused sources.
     repair_to_permutation(&mut assigned_src, n);
 
-    assigned_src
+    Some(assigned_src)
 }
 
 /// One phase of the forward auction at a fixed ε.
-fn auction_phase(
+fn auction_phase<F>(
     cost: &CostLookup,
     candidates: &[Vec<usize>],
     prices: &mut [f64],
     assigned_dst: &mut [usize],
     assigned_src: &mut [usize],
     epsilon: f64,
-) {
+    checkpoint: &mut F,
+) -> bool
+where
+    F: FnMut() -> bool,
+{
     let n = cost.n_dst();
 
     // Collect the set of unassigned sources. We iterate: each unassigned
@@ -155,6 +177,9 @@ fn auction_phase(
 
     while !unassigned_sources.is_empty() && iter_guard < max_iters {
         iter_guard += 1;
+        if iter_guard % 512 == 0 && !checkpoint() {
+            return false;
+        }
 
         // Pick the next unassigned source (FIFO for determinism).
         let Some(src) = unassigned_sources.pop_front() else {
@@ -203,6 +228,7 @@ fn auction_phase(
         assigned_dst[src] = best_dst;
         assigned_src[best_dst] = src;
     }
+    true
 }
 
 /// Estimate the maximum absolute cost over the candidate edges. Used to set
@@ -246,13 +272,24 @@ fn repair_to_permutation(assigned_src: &mut [usize], n: usize) {
 /// Dense forward auction: every source considers every target. Used as a
 /// standalone exact/approximate solver and as a baseline.
 pub fn solve_dense(cost: &CostLookup, epsilon_phases: usize) -> Option<Vec<usize>> {
+    solve_dense_with_checkpoint(cost, epsilon_phases, || true).flatten()
+}
+
+pub(crate) fn solve_dense_with_checkpoint<F>(
+    cost: &CostLookup,
+    epsilon_phases: usize,
+    checkpoint: F,
+) -> Option<Option<Vec<usize>>>
+where
+    F: FnMut() -> bool,
+{
     let n = cost.n_dst();
     if n > MAX_DENSE_AUCTION_N {
-        return None;
+        return Some(None);
     }
     // Full candidate lists.
     let candidates: Vec<Vec<usize>> = (0..n).map(|_| (0..n).collect()).collect();
-    Some(sparse_auction(cost, &candidates, None, epsilon_phases))
+    sparse_auction_with_checkpoint(cost, &candidates, None, epsilon_phases, checkpoint).map(Some)
 }
 
 /// Dense forward auction with ε-scaling. Capped at `MAX_DENSE_AUCTION_N`.
@@ -261,17 +298,23 @@ pub fn process_auction<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (cost, source_pixels, _target_pixels) = build_problem(&unprocessed, &settings)?;
     let n = cost.n_dst();
 
     tx.send(ProgressMsg::Progress(0.0));
-    let Some(assignments) = solve_dense(&cost, DEFAULT_EPSILON_PHASES) else {
-        tx.send(ProgressMsg::Error(format!(
-            "dense auction is limited to {MAX_DENSE_AUCTION_N} pixels; use multiscale sparse auction for this resolution"
-        )));
-        return Ok(());
+    let solve_result =
+        solve_dense_with_checkpoint(&cost, DEFAULT_EPSILON_PHASES, || !checkpoint(&control, tx));
+    let assignments = match solve_result {
+        Some(Some(assignments)) => assignments,
+        Some(None) => {
+            tx.send(ProgressMsg::Error(format!(
+                "dense auction is limited to {MAX_DENSE_AUCTION_N} pixels; use multiscale sparse auction for this resolution"
+            )));
+            return Ok(());
+        }
+        None => return Ok(()),
     };
     if let Err(err) = validate_permutation(&assignments, n) {
         tx.send(ProgressMsg::Error(format!(
@@ -280,13 +323,6 @@ pub fn process_auction<S: ProgressSink>(
         return Ok(());
     }
     emit_preview(tx, &source_pixels, &assignments, settings.sidelen, 0.95);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if check_cancel(&cancel, tx) {
-            return Ok(());
-        }
-    }
 
     finalize_preset(
         tx,

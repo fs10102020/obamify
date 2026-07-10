@@ -90,6 +90,10 @@ pub struct ObamifyApp {
     progress_tx: mpsc::SyncSender<ProgressMsg>,
     #[cfg(not(target_arch = "wasm32"))]
     progress_rx: mpsc::Receiver<ProgressMsg>,
+    #[cfg(not(target_arch = "wasm32"))]
+    drawing_tx: mpsc::SyncSender<ProgressMsg>,
+    #[cfg(not(target_arch = "wasm32"))]
+    drawing_rx: mpsc::Receiver<ProgressMsg>,
 
     #[cfg(target_arch = "wasm32")]
     worker: Option<Worker>,
@@ -702,6 +706,8 @@ impl ObamifyApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         let (progress_tx, progress_rx) = mpsc::sync_channel::<ProgressMsg>(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        let (drawing_tx, drawing_rx) = mpsc::sync_channel::<ProgressMsg>(1);
 
         Self {
             size,
@@ -745,6 +751,10 @@ impl ObamifyApp {
             progress_tx,
             #[cfg(not(target_arch = "wasm32"))]
             progress_rx,
+            #[cfg(not(target_arch = "wasm32"))]
+            drawing_tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            drawing_rx,
             gif_recorder: gif_recorder::GifRecorder::new(),
             preview_image: None,
             stroke_count: 0,
@@ -780,6 +790,16 @@ impl ObamifyApp {
                     None
                 }
             }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    /// Returns the next drawing-optimizer message without mixing it with a
+    /// generation job's progress stream.
+    pub fn get_latest_drawing_msg(&mut self) -> Option<ProgressMsg> {
+        match self.drawing_rx.try_recv() {
+            Ok(msg) => Some(msg),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => None,
         }
     }
 
@@ -918,14 +938,19 @@ impl ObamifyApp {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn start_job(&mut self, src: UnprocessedPreset, settings: GenerationSettings) {
+    fn start_job(
+        &mut self,
+        src: UnprocessedPreset,
+        settings: GenerationSettings,
+        control: &calculate::util::SolverControl,
+    ) {
         self.inbox.borrow_mut().clear();
         if let Some(w) = &self.worker {
             let req = calculate::worker::WorkerReq {
                 source: src,
                 settings,
             };
-            let v = match serde_wasm_bindgen::to_value(&req) {
+            let request_value = match serde_wasm_bindgen::to_value(&req) {
                 Ok(v) => v,
                 Err(e) => {
                     self.inbox
@@ -934,7 +959,11 @@ impl ObamifyApp {
                     return;
                 }
             };
-            match w.post_message(&v) {
+            let envelope = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&envelope, &JsValue::from_str("request"), &request_value);
+            let _ =
+                js_sys::Reflect::set(&envelope, &JsValue::from_str("control"), &control.shared());
+            match w.post_message(&envelope) {
                 Ok(()) => {}
                 Err(e) => {
                     self.inbox
@@ -1644,7 +1673,7 @@ impl ObamifyApp {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
             std::thread::spawn({
-                let tx = self.progress_tx.clone();
+                let tx = self.drawing_tx.clone();
                 let colors = Arc::clone(&self.colors);
                 let pixel_data = Arc::clone(&self.pixeldata);
                 let current_id = self.current_drawing_id.clone();

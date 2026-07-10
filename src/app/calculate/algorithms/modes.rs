@@ -12,27 +12,31 @@
 //! - **Maximum**: Balanced result → expand candidate sets → continue auction
 //!   refinement → small augmenting-path improvements.
 
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, atomic::AtomicBool};
-
 use crate::app::calculate::ProgressMsg;
 #[cfg(test)]
 use crate::app::calculate::algorithms::assert_valid_permutation;
-use crate::app::calculate::algorithms::auction::solve_dense as auction_dense;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::app::calculate::algorithms::check_cancel;
-use crate::app::calculate::algorithms::multiscale::local_swap_refinement;
+use crate::app::calculate::algorithms::auction::{
+    solve_dense as auction_dense, solve_dense_with_checkpoint as auction_dense_with_checkpoint,
+};
+use crate::app::calculate::algorithms::checkpoint;
 use crate::app::calculate::algorithms::multiscale::process_multiscale;
 use crate::app::calculate::algorithms::multiscale::solve as multiscale_solve;
+use crate::app::calculate::algorithms::multiscale::solve_with_checkpoint as multiscale_solve_with_checkpoint;
+use crate::app::calculate::algorithms::multiscale::{
+    local_swap_refinement, local_swap_refinement_with_checkpoint,
+};
 use crate::app::calculate::algorithms::patchmatch::solve as patchmatch_solve;
+use crate::app::calculate::algorithms::patchmatch::solve_with_checkpoint as patchmatch_solve_with_checkpoint;
 use crate::app::calculate::algorithms::{
     CostLookup, build_problem, emit_preview, finalize_preset, total_cost, validate_permutation,
 };
 use crate::app::calculate::util::GenerationSettings;
 use crate::app::calculate::util::ProgressSink;
+use crate::app::calculate::util::SolverControl;
 use crate::app::preset::UnprocessedPreset;
 
 /// Fast mode: PatchMatch → sparse auction → local swaps.
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn solve_fast(cost: &CostLookup, sidelen: u32) -> Vec<usize> {
     let n = cost.n_dst();
     if n == 0 {
@@ -49,6 +53,21 @@ pub fn solve_fast(cost: &CostLookup, sidelen: u32) -> Vec<usize> {
     local_swap_refinement(cost, &mut assignments, sidelen, 1);
 
     assignments
+}
+
+fn solve_fast_with_checkpoint<F>(
+    cost: &CostLookup,
+    sidelen: u32,
+    mut checkpoint: F,
+) -> Option<Vec<usize>>
+where
+    F: FnMut() -> bool,
+{
+    let mut assignments = patchmatch_solve_with_checkpoint(cost, sidelen, &mut checkpoint)?;
+    if !local_swap_refinement_with_checkpoint(cost, &mut assignments, sidelen, 1, &mut checkpoint) {
+        return None;
+    }
+    Some(assignments)
 }
 
 /// Balanced mode: equivalent to the full multiscale pipeline.
@@ -72,6 +91,7 @@ pub fn solve_balanced(
 
 /// Maximum mode: Balanced result → dense auction refinement with small ε when
 /// the dense refinement is safe for the selected resolution.
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn solve_maximum(
     cost: &CostLookup,
     source_pixels: &[(u8, u8, u8)],
@@ -114,19 +134,56 @@ pub fn solve_maximum(
     assignments
 }
 
+fn solve_maximum_with_checkpoint<F>(
+    cost: &CostLookup,
+    source_pixels: &[(u8, u8, u8)],
+    target_pixels: &[(u8, u8, u8)],
+    weights: &[i64],
+    sidelen: u32,
+    proximity_importance: i64,
+    mut checkpoint: F,
+) -> Option<Vec<usize>>
+where
+    F: FnMut() -> bool,
+{
+    let mut assignments = multiscale_solve_with_checkpoint(
+        cost,
+        source_pixels,
+        target_pixels,
+        weights,
+        sidelen,
+        proximity_importance,
+        &mut checkpoint,
+    )?;
+    match auction_dense_with_checkpoint(cost, 8, &mut checkpoint)? {
+        Some(refined) if total_cost(cost, &refined) < total_cost(cost, &assignments) => {
+            assignments = refined
+        }
+        _ => {}
+    }
+    if !local_swap_refinement_with_checkpoint(cost, &mut assignments, sidelen, 5, &mut checkpoint) {
+        return None;
+    }
+    Some(assignments)
+}
+
 /// Fast mode: PatchMatch → local swaps.
 /// Entry point for Fast mode.
 pub fn process_fast<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (cost, source_pixels, _target_pixels) = build_problem(&unprocessed, &settings)?;
     let n = cost.n_dst();
 
     tx.send(ProgressMsg::Progress(0.0));
-    let assignments = solve_fast(&cost, settings.sidelen);
+    let Some(assignments) =
+        solve_fast_with_checkpoint(&cost, settings.sidelen, || !checkpoint(&control, tx))
+    else {
+        return Ok(());
+    };
     if let Err(err) = validate_permutation(&assignments, n) {
         tx.send(ProgressMsg::Error(format!(
             "Fast mode produced invalid assignment: {err}"
@@ -134,13 +191,6 @@ pub fn process_fast<S: ProgressSink>(
         return Ok(());
     }
     emit_preview(tx, &source_pixels, &assignments, settings.sidelen, 0.95);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if check_cancel(&cancel, tx) {
-            return Ok(());
-        }
-    }
 
     finalize_preset(
         tx,
@@ -158,16 +208,9 @@ pub fn process_balanced<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        process_multiscale(unprocessed, settings, tx, cancel)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        process_multiscale(unprocessed, settings, tx)
-    }
+    process_multiscale(unprocessed, settings, tx, control)
 }
 
 /// Maximum mode: Balanced + dense auction refinement when size permits.
@@ -176,21 +219,24 @@ pub fn process_maximum<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (cost, source_pixels, target_pixels) = build_problem(&unprocessed, &settings)?;
     let n = cost.n_dst();
     let weights = &cost.weights;
 
     tx.send(ProgressMsg::Progress(0.0));
-    let assignments = solve_maximum(
+    let Some(assignments) = solve_maximum_with_checkpoint(
         &cost,
         &source_pixels,
         &target_pixels,
         weights,
         settings.sidelen,
         settings.proximity_importance,
-    );
+        || !checkpoint(&control, tx),
+    ) else {
+        return Ok(());
+    };
     if let Err(err) = validate_permutation(&assignments, n) {
         tx.send(ProgressMsg::Error(format!(
             "Maximum mode produced invalid assignment: {err}"
@@ -198,13 +244,6 @@ pub fn process_maximum<S: ProgressSink>(
         return Ok(());
     }
     emit_preview(tx, &source_pixels, &assignments, settings.sidelen, 0.95);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if check_cancel(&cancel, tx) {
-            return Ok(());
-        }
-    }
 
     finalize_preset(
         tx,

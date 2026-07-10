@@ -13,13 +13,9 @@
 //! deliberately capped to small images; full-size Obamify runs should use the
 //! multiscale sparse auction path.
 
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, atomic::AtomicBool};
-
 use crate::app::calculate::ProgressMsg;
-use crate::app::calculate::algorithms::auction::sparse_auction;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::app::calculate::algorithms::check_cancel;
+use crate::app::calculate::algorithms::auction::sparse_auction_with_checkpoint;
+use crate::app::calculate::algorithms::checkpoint;
 use crate::app::calculate::algorithms::{
     CostLookup, build_problem, emit_preview, finalize_preset, validate_permutation,
 };
@@ -27,6 +23,7 @@ use crate::app::calculate::algorithms::{
 use crate::app::calculate::algorithms::{assert_valid_permutation, total_cost};
 use crate::app::calculate::util::GenerationSettings;
 use crate::app::calculate::util::ProgressSink;
+use crate::app::calculate::util::SolverControl;
 use crate::app::preset::UnprocessedPreset;
 
 /// Number of Sinkhorn iterations per ε level.
@@ -52,11 +49,20 @@ pub const MAX_DENSE_SINKHORN_N: usize = 1024;
 /// `row_mass` and `col_mass` are the target marginals (both uniform = 1/n for
 /// the assignment problem). The returned plan approximates the optimal
 /// entropy-regularized transport.
-fn sinkhorn_log_domain(cost: &CostLookup, epsilon: f64, iters: usize, plan: &mut Vec<Vec<f64>>) {
+fn sinkhorn_log_domain<F>(
+    cost: &CostLookup,
+    epsilon: f64,
+    iters: usize,
+    plan: &mut Vec<Vec<f64>>,
+    checkpoint: &mut F,
+) -> bool
+where
+    F: FnMut() -> bool,
+{
     let n = cost.n_dst();
     if n == 0 {
         plan.clear();
-        return;
+        return true;
     }
 
     // Shift costs to non-negative. Find the min cost (most negative) and shift.
@@ -86,6 +92,9 @@ fn sinkhorn_log_domain(cost: &CostLookup, epsilon: f64, iters: usize, plan: &mut
 
     let mut terms = Vec::with_capacity(n);
     for _iter in 0..iters {
+        if !checkpoint() {
+            return false;
+        }
         // Update log_u: u[i] = log_row_mass - logsumexp_j(K[i,j] + v[j])
         for (i, log_u_i) in log_u.iter_mut().enumerate() {
             terms.clear();
@@ -122,6 +131,7 @@ fn sinkhorn_log_domain(cost: &CostLookup, epsilon: f64, iters: usize, plan: &mut
             *cell = (k_ij + log_u[i] + log_v[j]).exp().max(0.0);
         }
     }
+    true
 }
 
 /// Numerically stable log-sum-exp.
@@ -142,10 +152,17 @@ fn logsumexp(terms: &[f64]) -> f64 {
 /// Extract the top-k candidate sources per target from the transport plan,
 /// then run sparse auction over those candidates to produce a valid
 /// permutation. The auction naturally resolves collisions and fills gaps.
-fn round_to_permutation(plan: &[Vec<f64>], cost: &CostLookup) -> Vec<usize> {
+fn round_to_permutation<F>(
+    plan: &[Vec<f64>],
+    cost: &CostLookup,
+    checkpoint: &mut F,
+) -> Option<Vec<usize>>
+where
+    F: FnMut() -> bool,
+{
     let n = plan.len();
     if n == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     // Build candidate lists from the transport plan: for each target, use the
@@ -162,20 +179,28 @@ fn round_to_permutation(plan: &[Vec<f64>], cost: &CostLookup) -> Vec<usize> {
     }
 
     // Sparse auction over the top-k candidates produces a valid permutation.
-    sparse_auction(cost, &candidates, None, 3)
+    sparse_auction_with_checkpoint(cost, &candidates, None, 3, checkpoint)
 }
 
 /// Run the full Sinkhorn + rounding pipeline and return the assignment.
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn solve(cost: &CostLookup) -> Option<Vec<usize>> {
+    solve_with_checkpoint(cost, || true).flatten()
+}
+
+fn solve_with_checkpoint<F>(cost: &CostLookup, mut checkpoint: F) -> Option<Option<Vec<usize>>>
+where
+    F: FnMut() -> bool,
+{
     let n = cost.n_dst();
     if n == 0 {
-        return Some(Vec::new());
+        return Some(Some(Vec::new()));
     }
     if n == 1 {
-        return Some(vec![0]);
+        return Some(Some(vec![0]));
     }
     if n > MAX_DENSE_SINKHORN_N {
-        return None;
+        return Some(None);
     }
 
     // Estimate the cost spread for the initial ε.
@@ -197,12 +222,14 @@ pub fn solve(cost: &CostLookup) -> Option<Vec<usize>> {
 
     let mut plan = vec![vec![0.0f64; n]; n];
     for _level in 0..SINKHORN_LEVELS {
-        sinkhorn_log_domain(cost, epsilon, SINKHORN_ITERS, &mut plan);
+        if !sinkhorn_log_domain(cost, epsilon, SINKHORN_ITERS, &mut plan, &mut checkpoint) {
+            return None;
+        }
         epsilon *= EPS_DECAY;
         epsilon = epsilon.max(1.0);
     }
 
-    Some(round_to_permutation(&plan, cost))
+    round_to_permutation(&plan, cost, &mut checkpoint).map(Some)
 }
 
 /// Entropy-regularized OT (log-domain Sinkhorn) + top-k rounding via sparse auction.
@@ -211,17 +238,22 @@ pub fn process_sinkhorn<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (cost, source_pixels, _target_pixels) = build_problem(&unprocessed, &settings)?;
     let n = cost.n_dst();
 
     tx.send(ProgressMsg::Progress(0.0));
-    let Some(assignments) = solve(&cost) else {
-        tx.send(ProgressMsg::Error(format!(
-            "dense Sinkhorn is limited to {MAX_DENSE_SINKHORN_N} pixels; use multiscale sparse auction for this resolution"
-        )));
-        return Ok(());
+    let solve_result = solve_with_checkpoint(&cost, || !checkpoint(&control, tx));
+    let assignments = match solve_result {
+        Some(Some(assignments)) => assignments,
+        Some(None) => {
+            tx.send(ProgressMsg::Error(format!(
+                "dense Sinkhorn is limited to {MAX_DENSE_SINKHORN_N} pixels; use multiscale sparse auction for this resolution"
+            )));
+            return Ok(());
+        }
+        None => return Ok(()),
     };
     if let Err(err) = validate_permutation(&assignments, n) {
         tx.send(ProgressMsg::Error(format!(
@@ -230,13 +262,6 @@ pub fn process_sinkhorn<S: ProgressSink>(
         return Ok(());
     }
     emit_preview(tx, &source_pixels, &assignments, settings.sidelen, 0.95);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if check_cancel(&cancel, tx) {
-            return Ok(());
-        }
-    }
 
     finalize_preset(
         tx,
@@ -336,7 +361,7 @@ mod tests {
             vec![0.1, 0.1, 0.8],   // dst 2 -> src 2
         ];
         let cost = identical_pixel_lookup(n, 13);
-        let assignments = round_to_permutation(&plan, &cost);
+        let assignments = round_to_permutation(&plan, &cost, &mut || true).unwrap();
         assert_valid_permutation(&assignments, n);
     }
 

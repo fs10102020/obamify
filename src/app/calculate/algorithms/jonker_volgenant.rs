@@ -9,12 +9,8 @@
 //! This module also serves as the coarse-level exact baseline for
 //! [`super::multiscale`].
 
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, atomic::AtomicBool};
-
 use crate::app::calculate::ProgressMsg;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::app::calculate::algorithms::check_cancel;
+use crate::app::calculate::algorithms::checkpoint;
 use crate::app::calculate::algorithms::{
     CostLookup, MAX_EXACT_N, build_problem, emit_preview, finalize_preset, validate_permutation,
 };
@@ -22,6 +18,7 @@ use crate::app::calculate::algorithms::{
 use crate::app::calculate::algorithms::{assert_valid_permutation, total_cost};
 use crate::app::calculate::util::GenerationSettings;
 use crate::app::calculate::util::ProgressSink;
+use crate::app::calculate::util::SolverControl;
 use crate::app::preset::UnprocessedPreset;
 
 /// Solve the linear assignment problem via shortest augmenting paths (Kuhn-Munkres core).
@@ -29,18 +26,29 @@ use crate::app::preset::UnprocessedPreset;
 ///
 /// Exposed publicly so the multiscale backend can call it at coarse levels and
 /// tests can verify it directly.
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn solve(cost: &CostLookup) -> Vec<usize> {
+    solve_with_checkpoint(cost, || true).expect("uncontrolled solve cannot be cancelled")
+}
+
+pub(crate) fn solve_with_checkpoint<F>(cost: &CostLookup, checkpoint: F) -> Option<Vec<usize>>
+where
+    F: FnMut() -> bool,
+{
     let n = cost.n_dst();
     debug_assert_eq!(n, cost.n_src(), "obamify costs are square");
-    jonker_volgenant_dense(cost, n)
+    jonker_volgenant_dense(cost, n, checkpoint)
 }
 
 /// Core dense exact LAP solver. Returns `assignments[dst] = src` as a
 /// permutation of `0..n`. The positive `CostLookup` cost is minimized by
 /// maximizing its negation.
-fn jonker_volgenant_dense(cost: &CostLookup, n: usize) -> Vec<usize> {
+fn jonker_volgenant_dense<F>(cost: &CostLookup, n: usize, mut checkpoint: F) -> Option<Vec<usize>>
+where
+    F: FnMut() -> bool,
+{
     if n == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     #[inline(always)]
@@ -61,6 +69,9 @@ fn jonker_volgenant_dense(cost: &CostLookup, n: usize) -> Vec<usize> {
     let mut slackx = Vec::with_capacity(n);
 
     for root in 0..n {
+        if !checkpoint() {
+            return None;
+        }
         alternating.clear();
         alternating.resize(n, None);
         s_list.clear();
@@ -126,7 +137,7 @@ fn jonker_volgenant_dense(cost: &CostLookup, n: usize) -> Vec<usize> {
         }
     }
 
-    xy.into_iter().map(|o| o.unwrap()).collect()
+    Some(xy.into_iter().map(|o| o.unwrap()).collect())
 }
 
 /// Exact Jonker-Volgenant (KM shortest-augmenting-path) linear assignment solver.
@@ -135,7 +146,7 @@ pub fn process_jonker_volgenant<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (cost, source_pixels, _target_pixels) = build_problem(&unprocessed, &settings)?;
     let n = cost.n_dst();
@@ -151,7 +162,9 @@ pub fn process_jonker_volgenant<S: ProgressSink>(
     // `process_optimal` so the GUI bar moves similarly. The solver itself
     // runs to completion in one call, so we emit before/after.
     tx.send(ProgressMsg::Progress(0.0));
-    let assignments = solve(&cost);
+    let Some(assignments) = solve_with_checkpoint(&cost, || !checkpoint(&control, tx)) else {
+        return Ok(());
+    };
     if let Err(err) = validate_permutation(&assignments, n) {
         tx.send(ProgressMsg::Error(format!(
             "Jonker-Volgenant produced invalid assignment: {err}"
@@ -159,13 +172,6 @@ pub fn process_jonker_volgenant<S: ProgressSink>(
         return Ok(());
     }
     emit_preview(tx, &source_pixels, &assignments, settings.sidelen, 0.95);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if check_cancel(&cancel, tx) {
-            return Ok(());
-        }
-    }
 
     finalize_preset(
         tx,

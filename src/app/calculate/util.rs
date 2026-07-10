@@ -7,6 +7,223 @@ use uuid::Uuid;
 
 use std::error::Error;
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+
+/// Cooperative execution control shared by a solver and the GUI.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct SolverControl {
+    cancelled: Arc<AtomicBool>,
+    frame: Arc<AtomicU64>,
+    pause: Arc<(Mutex<PauseState>, Condvar)>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct PauseState {
+    paused: bool,
+    step_tokens: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for SolverControl {
+    fn default() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            frame: Arc::new(AtomicU64::new(0)),
+            pause: Arc::new((Mutex::new(PauseState::default()), Condvar::new())),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SolverControl {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.pause.1.notify_all();
+    }
+    pub fn pause(&self) {
+        let mut state = self.pause.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.paused = true;
+        state.step_tokens = 0;
+    }
+    pub fn resume(&self) {
+        let mut state = self.pause.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.paused = false;
+        state.step_tokens = 0;
+        self.pause.1.notify_all();
+    }
+    pub fn step(&self) {
+        let mut state = self.pause.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.paused = true;
+        state.step_tokens = state.step_tokens.saturating_add(1);
+        self.pause.1.notify_all();
+    }
+    pub fn is_paused(&self) -> bool {
+        self.pause
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .paused
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+    pub fn frame(&self) -> u64 {
+        self.frame.load(Ordering::Acquire)
+    }
+    pub fn checkpoint(&self) -> bool {
+        self.frame.fetch_add(1, Ordering::AcqRel);
+        if self.is_cancelled() {
+            return false;
+        }
+        let (lock, wake) = &*self.pause;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while state.paused && state.step_tokens == 0 && !self.is_cancelled() {
+            state = wake.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        if self.is_cancelled() {
+            return false;
+        }
+        if state.paused && state.step_tokens > 0 {
+            state.step_tokens -= 1;
+        }
+        true
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(inline_js = r#"
+const CANCELLED = 0, PAUSED = 1, STEP_TOKENS = 2, FRAME = 3;
+function view(buffer) { return buffer ? new Int32Array(buffer) : null; }
+export function solver_control_new() { try { return new SharedArrayBuffer(16); } catch (_) { return null; } }
+export function solver_control_available(buffer) { return buffer !== null && buffer !== undefined; }
+export function solver_control_cancel(buffer) { const s=view(buffer); if (!s) return; Atomics.store(s,CANCELLED,1); Atomics.notify(s,PAUSED); }
+export function solver_control_pause(buffer) { const s=view(buffer); if (!s) return; Atomics.store(s,STEP_TOKENS,0); Atomics.store(s,PAUSED,1); }
+export function solver_control_resume(buffer) { const s=view(buffer); if (!s) return; Atomics.store(s,STEP_TOKENS,0); Atomics.store(s,PAUSED,0); Atomics.notify(s,PAUSED); }
+export function solver_control_step(buffer) { const s=view(buffer); if (!s) return; Atomics.store(s,PAUSED,1); Atomics.add(s,STEP_TOKENS,1); Atomics.notify(s,PAUSED,1); }
+export function solver_control_is_paused(buffer) { const s=view(buffer); return s ? Atomics.load(s,PAUSED)!==0 : false; }
+export function solver_control_is_cancelled(buffer) { const s=view(buffer); return s ? Atomics.load(s,CANCELLED)!==0 : false; }
+export function solver_control_frame(buffer) { const s=view(buffer); return s ? Atomics.load(s,FRAME)>>>0 : 0; }
+export function solver_control_checkpoint(buffer) {
+  const s=view(buffer); if (!s) return true; Atomics.add(s,FRAME,1);
+  if (Atomics.load(s,CANCELLED)) return false;
+  while (Atomics.load(s,PAUSED)) {
+    let tokens=Atomics.load(s,STEP_TOKENS);
+    while (tokens>0) { if (Atomics.compareExchange(s,STEP_TOKENS,tokens,tokens-1)===tokens) return !Atomics.load(s,CANCELLED); tokens=Atomics.load(s,STEP_TOKENS); }
+    Atomics.wait(s,PAUSED,1,100); if (Atomics.load(s,CANCELLED)) return false;
+  }
+  return !Atomics.load(s,CANCELLED);
+}
+"#)]
+extern "C" {
+    fn solver_control_new() -> JsValue;
+    fn solver_control_available(buffer: &JsValue) -> bool;
+    fn solver_control_cancel(buffer: &JsValue);
+    fn solver_control_pause(buffer: &JsValue);
+    fn solver_control_resume(buffer: &JsValue);
+    fn solver_control_step(buffer: &JsValue);
+    fn solver_control_is_paused(buffer: &JsValue) -> bool;
+    fn solver_control_is_cancelled(buffer: &JsValue) -> bool;
+    fn solver_control_frame(buffer: &JsValue) -> u32;
+    fn solver_control_checkpoint(buffer: &JsValue) -> bool;
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone)]
+pub struct SolverControl {
+    shared: JsValue,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Default for SolverControl {
+    fn default() -> Self {
+        Self {
+            shared: solver_control_new(),
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl SolverControl {
+    pub fn from_shared(shared: JsValue) -> Self {
+        Self { shared }
+    }
+    pub fn shared(&self) -> JsValue {
+        self.shared.clone()
+    }
+    pub fn is_available(&self) -> bool {
+        solver_control_available(&self.shared)
+    }
+    pub fn cancel(&self) {
+        solver_control_cancel(&self.shared);
+    }
+    pub fn pause(&self) {
+        solver_control_pause(&self.shared);
+    }
+    pub fn resume(&self) {
+        solver_control_resume(&self.shared);
+    }
+    pub fn step(&self) {
+        solver_control_step(&self.shared);
+    }
+    pub fn is_paused(&self) -> bool {
+        solver_control_is_paused(&self.shared)
+    }
+    pub fn is_cancelled(&self) -> bool {
+        solver_control_is_cancelled(&self.shared)
+    }
+    pub fn frame(&self) -> u64 {
+        solver_control_frame(&self.shared) as u64
+    }
+    pub fn checkpoint(&self) -> bool {
+        solver_control_checkpoint(&self.shared)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod solver_control_tests {
+    use super::SolverControl;
+    use std::{sync::mpsc, time::Duration};
+    #[test]
+    fn step_releases_one_checkpoint() {
+        let control = SolverControl::default();
+        control.pause();
+        let c = control.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(c.checkpoint()).unwrap();
+            tx.send(c.checkpoint()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        control.step();
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        control.step();
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+    }
+    #[test]
+    fn cancel_wakes_checkpoint() {
+        let control = SolverControl::default();
+        control.pause();
+        let c = control.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || tx.send(c.checkpoint()).unwrap());
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        control.cancel();
+        assert!(!rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+    }
+}
+
 /// Trait for receiving progress messages from background computation.
 pub trait ProgressSink {
     fn send(&mut self, msg: ProgressMsg);

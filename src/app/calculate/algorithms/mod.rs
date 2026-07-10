@@ -24,10 +24,9 @@
 //!   dense auction refinement when size permits).
 //!
 //! Every backend mirrors the legacy signature: a `process_<name>` free function
-//! that takes an `UnprocessedPreset`, `GenerationSettings`, a `ProgressSink`, and
-//! (on native only) an `Arc<AtomicBool>` cancel flag. This makes them drop-in
-//! arms for the `process` dispatcher in the parent module for both the native
-//! and wasm builds.
+//! that takes an `UnprocessedPreset`, `GenerationSettings`, a `ProgressSink`,
+//! and a shared [`SolverControl`] handle. This makes them drop-in arms for the
+//! `process` dispatcher in the parent module for both native and wasm builds.
 
 pub mod auction;
 pub mod jonker_volgenant;
@@ -36,10 +35,7 @@ pub mod multiscale;
 pub mod patchmatch;
 pub mod sinkhorn;
 
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, atomic::AtomicBool};
-
-use crate::app::calculate::util::{GenerationSettings, ProgressSink};
+use crate::app::calculate::util::{GenerationSettings, ProgressSink, SolverControl};
 use crate::app::calculate::{ProgressMsg, UnprocessedPreset, heuristic, make_new_img};
 
 /// Dense exact solvers become impractical beyond 64×64 in the interactive UI.
@@ -292,12 +288,9 @@ pub fn finalize_preset<S: ProgressSink>(
     }));
 }
 
-/// Native-only cancel check. Sends `Cancelled` and returns `true` if the
-/// caller should abort. On wasm there is no cancel flag (the worker is
-/// terminated instead), so this always returns `false`.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn check_cancel<S: ProgressSink>(cancel: &Arc<AtomicBool>, tx: &mut S) -> bool {
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+/// Reaches a cooperative solver checkpoint and reports cancellation.
+pub fn checkpoint<S: ProgressSink>(control: &SolverControl, tx: &mut S) -> bool {
+    if !control.checkpoint() {
         tx.send(ProgressMsg::Cancelled);
         true
     } else {

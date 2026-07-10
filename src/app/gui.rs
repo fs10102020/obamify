@@ -7,6 +7,7 @@ use crate::app::calculate;
 use crate::app::calculate::ProgressMsg;
 use crate::app::calculate::util::CropScale;
 use crate::app::calculate::util::GenerationSettings;
+use crate::app::calculate::util::SolverControl;
 use crate::app::calculate::util::SourceImg;
 use crate::app::gif_recorder::GIF_FRAMERATE;
 use crate::app::gif_recorder::GIF_RESOLUTION;
@@ -21,9 +22,6 @@ use egui::TextureHandle;
 use egui::Window;
 use image::buffer::ConvertBuffer;
 use image::imageops;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 // #[cfg(not(target_arch = "wasm32"))]
@@ -57,7 +55,7 @@ pub(crate) struct GuiState {
     //pub fps_text: String,
     show_progress_modal: Option<Uuid>,
     last_progress: f32,
-    process_cancelled: Option<Arc<AtomicBool>>,
+    solver_control: Option<SolverControl>,
     //pub currently_processing: Option<Preset>,
     pub presets: Vec<Preset>,
     //pub current_settings: GenerationSettings,
@@ -82,7 +80,7 @@ impl GuiState {
             mode: GuiMode::Transform,
             show_progress_modal: None,
             last_progress: 0.0,
-            process_cancelled: None,
+            solver_control: None,
             last_mouse_pos: None,
             drawing_color: [0.0, 0.0, 0.0, DRAWING_ALPHA],
             //currently_processing: None,
@@ -103,7 +101,7 @@ impl GuiState {
 
     fn hide_progress_modal(&mut self) {
         self.show_progress_modal = None;
-        self.process_cancelled = None;
+        self.solver_control = None;
         #[cfg(target_arch = "wasm32")]
         show_icons();
     }
@@ -310,7 +308,8 @@ impl App for ObamifyApp {
                                     self.init_canvas(device, &rs.queue);
                                 }
 
-                                while let Some(msg) = self.get_latest_msg() {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                while let Some(msg) = self.get_latest_drawing_msg() {
                                     match msg {
                                         ProgressMsg::UpdatePreview {
                                             width,
@@ -322,7 +321,6 @@ impl App for ObamifyApp {
                                             self.preview_image = image;
                                         }
                                         ProgressMsg::Cancelled => {
-                                            self.gui.process_cancelled = None;
                                             self.preview_image = None;
 
                                             ui.close();
@@ -754,8 +752,8 @@ impl App for ObamifyApp {
                                                 / (settings.sidelen as f32 / 128.0))
                                                 as i64;
 
-                                        let cancel_token = Arc::new(AtomicBool::new(false));
-                                        self.gui.process_cancelled = Some(Arc::clone(&cancel_token));
+                                        let solver_control = SolverControl::default();
+                                        self.gui.solver_control = Some(solver_control.clone());
 
                                         let unprocessed = UnprocessedPreset {
                                             name: settings.name.clone(),
@@ -768,20 +766,20 @@ impl App for ObamifyApp {
 
                                         #[cfg(target_arch = "wasm32")]
                                         {
-                                            self.start_job(unprocessed, settings);
+                                            self.start_job(unprocessed, settings, &solver_control);
                                         }
 
                                         #[cfg(not(target_arch = "wasm32"))]
                                         {
                                             std::thread::spawn({
                                                 let tx = self.progress_tx.clone();
-                                                let cancelled = cancel_token;
+                                                let control = solver_control;
                                                 move || {
                                                     let result = calculate::process(
                                                         unprocessed,
                                                         settings,
                                                         &mut tx.clone(),
-                                                        cancelled,
+                                                        control,
                                                     );
                                                     if let Err(err) = result {
                                                         let _ = tx.send(ProgressMsg::Error(
@@ -879,9 +877,9 @@ impl App for ObamifyApp {
 
                         if self
                             .gui
-                            .process_cancelled
+                            .solver_control
                             .as_ref()
-                            .is_some_and(|t| t.load(Ordering::Relaxed))
+                            .is_some_and(|c| c.is_cancelled())
                         {
                             ui.label("cancelling…");
                         } else if self.gui.last_progress == 0.0 {
@@ -892,23 +890,71 @@ impl App for ObamifyApp {
                         ui.add(egui::ProgressBar::new(self.gui.last_progress).show_percentage());
 
                         ui.horizontal(|ui| {
+                            if let Some(control) = &self.gui.solver_control {
+                                let paused = control.is_paused();
+                                let available = {
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        control.is_available()
+                                    }
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    {
+                                        true
+                                    }
+                                };
+                                if ui
+                                    .add_enabled(
+                                        available,
+                                        egui::Button::new(if paused { "Resume" } else { "Pause" }),
+                                    )
+                                    .clicked()
+                                {
+                                    if paused {
+                                        control.resume();
+                                    } else {
+                                        control.pause();
+                                    }
+                                }
+                                if ui
+                                    .add_enabled(available && paused, egui::Button::new("Step"))
+                                    .clicked()
+                                {
+                                    control.step();
+                                }
+                                ui.label(format!("frame {}", control.frame()));
+                                #[cfg(target_arch = "wasm32")]
+                                if !available {
+                                    ui.label("pause requires shared memory");
+                                }
+                            }
                             if ui.button("cancel").clicked() {
                                 #[cfg(target_arch = "wasm32")]
                                 {
-                                    if let Some(w) = &self.worker {
-                                        w.terminate();
+                                    if self
+                                        .gui
+                                        .solver_control
+                                        .as_ref()
+                                        .is_some_and(SolverControl::is_available)
+                                    {
+                                        if let Some(control) = &self.gui.solver_control {
+                                            control.cancel();
+                                        }
+                                    } else {
+                                        if let Some(w) = &self.worker {
+                                            w.terminate();
+                                        }
+                                        self.worker = None;
+                                        self.preview_image = None;
+                                        self.resize_textures(
+                                            device,
+                                            (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
+                                        );
+                                        self.gui.hide_progress_modal();
+                                        ui.close();
                                     }
-                                    self.worker = None;
-                                    self.preview_image = None;
-                                    self.resize_textures(
-                                        device,
-                                        (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
-                                    );
-                                    self.gui.hide_progress_modal();
-                                    ui.close();
                                 }
-                                if let Some(ref token) = self.gui.process_cancelled {
-                                    token.store(true, Ordering::Relaxed);
+                                if let Some(control) = &self.gui.solver_control {
+                                    control.cancel();
                                 }
                                 self.gui.last_progress = 0.0;
                             }

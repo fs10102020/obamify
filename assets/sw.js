@@ -1,4 +1,4 @@
-var CACHE_NAME = "obamify-pwa-v2"
+var CACHE_NAME = "obamify-pwa-v3"
 
 var filesToCache = [
     "./",
@@ -35,6 +35,8 @@ self.addEventListener("activate", function (e) {
                     return caches.delete(name)
                 })
             )
+        }).then(function () {
+            return self.clients.claim()
         })
     )
 })
@@ -56,6 +58,7 @@ self.addEventListener("fetch", function (e) {
 
 function networkFirst(request) {
     return fetch(request).then(function (response) {
+        response = withIsolationHeaders(response)
         if (response && response.status === 200) {
             var clone = response.clone()
             caches.open(CACHE_NAME).then(function (cache) {
@@ -64,7 +67,20 @@ function networkFirst(request) {
         }
         return response
     }).catch(function () {
-        return caches.match(request)
+        return caches.match(request).then(function (response) {
+            return response ? withIsolationHeaders(response) : response
+        })
+    })
+}
+
+function withIsolationHeaders(response) {
+    var headers = new Headers(response.headers)
+    headers.set("Cross-Origin-Opener-Policy", "same-origin")
+    headers.set("Cross-Origin-Embedder-Policy", "require-corp")
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: headers,
     })
 }
 

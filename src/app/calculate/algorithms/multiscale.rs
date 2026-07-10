@@ -12,14 +12,10 @@
 //! Prices are warm-started from the coarser level. After the auction, a
 //! 2-opt local swap pass cleans up residual sub-optimality.
 
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, atomic::AtomicBool};
-
 use crate::app::calculate::ProgressMsg;
-use crate::app::calculate::algorithms::auction::sparse_auction;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::app::calculate::algorithms::check_cancel;
-use crate::app::calculate::algorithms::jonker_volgenant::solve as jv_solve;
+use crate::app::calculate::algorithms::auction::sparse_auction_with_checkpoint;
+use crate::app::calculate::algorithms::checkpoint;
+use crate::app::calculate::algorithms::jonker_volgenant::solve_with_checkpoint as jv_solve;
 use crate::app::calculate::algorithms::{
     CostLookup, build_problem, emit_preview, finalize_preset, validate_permutation,
 };
@@ -27,6 +23,7 @@ use crate::app::calculate::algorithms::{
 use crate::app::calculate::algorithms::{assert_valid_permutation, total_cost};
 use crate::app::calculate::util::GenerationSettings;
 use crate::app::calculate::util::ProgressSink;
+use crate::app::calculate::util::SolverControl;
 use crate::app::preset::UnprocessedPreset;
 
 /// Coarsest pyramid level. Must be a power of two and <= sidelen.
@@ -255,12 +252,31 @@ pub fn local_swap_refinement(
     sidelen: u32,
     sweeps: usize,
 ) {
+    let _ = local_swap_refinement_with_checkpoint(cost, assignments, sidelen, sweeps, || true);
+}
+
+pub(crate) fn local_swap_refinement_with_checkpoint<F>(
+    cost: &CostLookup,
+    assignments: &mut [usize],
+    sidelen: u32,
+    sweeps: usize,
+    mut checkpoint: F,
+) -> bool
+where
+    F: FnMut() -> bool,
+{
     let n = assignments.len();
     let s = sidelen as usize;
 
     for _ in 0..sweeps {
+        if !checkpoint() {
+            return false;
+        }
         let mut improved = false;
         for dst_a in 0..n {
+            if dst_a % 1024 == 0 && !checkpoint() {
+                return false;
+            }
             let ax = dst_a % s;
             let ay = dst_a / s;
             // Check a small neighborhood of nearby targets.
@@ -294,6 +310,7 @@ pub fn local_swap_refinement(
             break;
         }
     }
+    true
 }
 
 /// Build a `CostLookup` for a specific pyramid level by downsampling.
@@ -335,6 +352,30 @@ pub fn solve(
     sidelen: u32,
     proximity_importance: i64,
 ) -> Vec<usize> {
+    solve_with_checkpoint(
+        cost,
+        source_pixels,
+        target_pixels,
+        weights,
+        sidelen,
+        proximity_importance,
+        || true,
+    )
+    .expect("uncancelled multiscale solve should complete")
+}
+
+pub(crate) fn solve_with_checkpoint<F>(
+    cost: &CostLookup,
+    source_pixels: &[(u8, u8, u8)],
+    target_pixels: &[(u8, u8, u8)],
+    weights: &[i64],
+    sidelen: u32,
+    proximity_importance: i64,
+    mut checkpoint: F,
+) -> Option<Vec<usize>>
+where
+    F: FnMut() -> bool,
+{
     solve_inner(
         cost,
         source_pixels,
@@ -342,9 +383,8 @@ pub fn solve(
         weights,
         sidelen,
         proximity_importance,
-        |_, _| true,
+        |_, _| checkpoint(),
     )
-    .expect("uncancelled multiscale solve should complete")
 }
 
 fn solve_inner<F>(
@@ -390,7 +430,7 @@ where
         let assignment = match (level_sidelen == COARSEST_SIDELEN, prev_assignment.as_ref()) {
             (true, _) | (false, None) => {
                 // Coarsest level or no previous: exact JV.
-                jv_solve(&level_cost)
+                jv_solve(&level_cost, || on_level(level_idx, total_levels))?
             }
             (false, Some(prev)) => {
                 // Finer level: upsample prediction, build candidates, sparse auction.
@@ -400,12 +440,13 @@ where
                 let warm_prices = prev_prices
                     .as_ref()
                     .map(|p| upsample_prices(p, from_sidelen, level_sidelen));
-                sparse_auction(
+                sparse_auction_with_checkpoint(
                     &level_cost,
                     &candidates,
                     warm_prices.as_deref(),
                     PHASES_PER_LEVEL,
-                )
+                    || on_level(level_idx, total_levels),
+                )?
             }
         };
 
@@ -417,7 +458,11 @@ where
 
     let mut final_assignment = prev_assignment.expect("pyramid produced no assignment");
     // 2-opt local refinement at the finest level.
-    local_swap_refinement(cost, &mut final_assignment, sidelen, 3);
+    if !local_swap_refinement_with_checkpoint(cost, &mut final_assignment, sidelen, 3, || {
+        on_level(total_levels, total_levels)
+    }) {
+        return None;
+    }
     Some(final_assignment)
 }
 
@@ -445,13 +490,12 @@ pub fn process_multiscale<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (cost, source_pixels, target_pixels) = build_problem(&unprocessed, &settings)?;
     let n = cost.n_dst();
     let weights = &cost.weights;
 
-    #[cfg(not(target_arch = "wasm32"))]
     let mut cancelled = false;
     let assignments = solve_inner(
         &cost,
@@ -463,31 +507,19 @@ pub fn process_multiscale<S: ProgressSink>(
         |level_idx, total_levels| {
             let progress = level_idx as f32 / total_levels as f32;
             tx.send(ProgressMsg::Progress(progress * 0.8));
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                if check_cancel(&cancel, tx) {
-                    cancelled = true;
-                    return false;
-                }
+            if checkpoint(&control, tx) {
+                cancelled = true;
+                return false;
             }
             true
         },
     );
 
     let Some(assignments) = assignments else {
-        #[cfg(target_arch = "wasm32")]
-        {
+        if !cancelled {
             tx.send(ProgressMsg::Error(
                 "multiscale solve did not complete".to_string(),
             ));
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if !cancelled {
-                tx.send(ProgressMsg::Error(
-                    "multiscale solve did not complete".to_string(),
-                ));
-            }
         }
         return Ok(());
     };
@@ -500,11 +532,8 @@ pub fn process_multiscale<S: ProgressSink>(
     }
     emit_preview(tx, &source_pixels, &assignments, settings.sidelen, 0.95);
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if check_cancel(&cancel, tx) {
-            return Ok(());
-        }
+    if checkpoint(&control, tx) {
+        return Ok(());
     }
 
     finalize_preset(

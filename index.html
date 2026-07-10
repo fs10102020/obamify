@@ -284,7 +284,17 @@
         // We disable caching during development so that we always view the latest version.
         if ('serviceWorker' in navigator && window.location.hash !== "#dev") {
             window.addEventListener('load', function () {
-                navigator.serviceWorker.register('sw.js');
+                navigator.serviceWorker.register('sw.js').then(function () {
+                    return navigator.serviceWorker.ready;
+                }).then(function () {
+                    if (!window.crossOriginIsolated &&
+                        !sessionStorage.getItem('obamify-isolation-reload')) {
+                        sessionStorage.setItem('obamify-isolation-reload', '1');
+                        window.location.reload();
+                    }
+                }).catch(function (error) {
+                    console.error('Service worker registration failed:', error);
+                });
             });
         }
 

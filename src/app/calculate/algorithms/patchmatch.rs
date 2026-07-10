@@ -12,13 +12,9 @@
 //! sparse candidate graph, then run sparse auction to produce a valid
 //! permutation.
 
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, atomic::AtomicBool};
-
 use crate::app::calculate::ProgressMsg;
-use crate::app::calculate::algorithms::auction::sparse_auction;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::app::calculate::algorithms::check_cancel;
+use crate::app::calculate::algorithms::auction::sparse_auction_with_checkpoint;
+use crate::app::calculate::algorithms::checkpoint;
 use crate::app::calculate::algorithms::{
     CostLookup, build_problem, emit_preview, finalize_preset, validate_permutation,
 };
@@ -26,6 +22,7 @@ use crate::app::calculate::algorithms::{
 use crate::app::calculate::algorithms::{assert_valid_permutation, total_cost};
 use crate::app::calculate::util::GenerationSettings;
 use crate::app::calculate::util::ProgressSink;
+use crate::app::calculate::util::SolverControl;
 use crate::app::preset::UnprocessedPreset;
 
 /// Number of PatchMatch iterations (propagation + random search passes).
@@ -42,10 +39,18 @@ const RANDOM_ATTEMPTS: usize = 8;
 
 /// Run PatchMatch-style search and return a (non-unique) assignment where
 /// `assignments[dst] = src`. Multiple dsts may map to the same src.
-fn patchmatch_search(cost: &CostLookup, sidelen: u32, iters: usize) -> Vec<usize> {
+fn patchmatch_search<F>(
+    cost: &CostLookup,
+    sidelen: u32,
+    iters: usize,
+    checkpoint: &mut F,
+) -> Option<Vec<usize>>
+where
+    F: FnMut() -> bool,
+{
     let n = cost.n_dst();
     if n == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let s = sidelen as i32;
 
@@ -74,6 +79,9 @@ fn patchmatch_search(cost: &CostLookup, sidelen: u32, iters: usize) -> Vec<usize
     let initial_radius = (s as f32 * INITIAL_RADIUS_FRAC).max(1.0) as i32;
 
     for iter in 0..iters {
+        if !checkpoint() {
+            return None;
+        }
         // Propagation pass: raster order (odd iters) or reverse (even iters).
         let forward = iter % 2 == 0;
         let order: Vec<usize> = if forward {
@@ -88,6 +96,9 @@ fn patchmatch_search(cost: &CostLookup, sidelen: u32, iters: usize) -> Vec<usize
         };
 
         for &dst in &order {
+            if dst % 512 == 0 && !checkpoint() {
+                return None;
+            }
             let dx_pos = dst % sidelen as usize;
             let dy_pos = dst / sidelen as usize;
             let current_cost = cost.cost(dst, assignments[dst]);
@@ -145,16 +156,24 @@ fn patchmatch_search(cost: &CostLookup, sidelen: u32, iters: usize) -> Vec<usize
         }
     }
 
-    assignments
+    Some(assignments)
 }
 
 /// Repair a non-unique assignment to a valid permutation.
 /// Use the raw PatchMatch source plus nearby sources as sparse candidates,
 /// then let sparse auction resolve collisions globally.
-fn repair_permutation(cost: &CostLookup, raw: &[usize], sidelen: u32) -> Vec<usize> {
+fn repair_permutation<F>(
+    cost: &CostLookup,
+    raw: &[usize],
+    sidelen: u32,
+    checkpoint: &mut F,
+) -> Option<Vec<usize>>
+where
+    F: FnMut() -> bool,
+{
     let n = cost.n_dst();
     if n == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     // Build candidates for the sparse auction repair: for each target, use
@@ -182,21 +201,32 @@ fn repair_permutation(cost: &CostLookup, raw: &[usize], sidelen: u32) -> Vec<usi
     }
 
     // Run sparse auction over the candidate lists to get a full permutation.
-    sparse_auction(cost, &candidates, None, 3)
+    sparse_auction_with_checkpoint(cost, &candidates, None, 3, checkpoint)
 }
 
 /// Run the full PatchMatch + repair pipeline and return the assignment.
 pub fn solve(cost: &CostLookup, sidelen: u32) -> Vec<usize> {
+    solve_with_checkpoint(cost, sidelen, || true).expect("uncontrolled solve cannot be cancelled")
+}
+
+pub(crate) fn solve_with_checkpoint<F>(
+    cost: &CostLookup,
+    sidelen: u32,
+    mut checkpoint: F,
+) -> Option<Vec<usize>>
+where
+    F: FnMut() -> bool,
+{
     let n = cost.n_dst();
     if n == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     if n == 1 {
-        return vec![0];
+        return Some(vec![0]);
     }
 
-    let raw = patchmatch_search(cost, sidelen, PATCHMATCH_ITERS);
-    repair_permutation(cost, &raw, sidelen)
+    let raw = patchmatch_search(cost, sidelen, PATCHMATCH_ITERS, &mut checkpoint)?;
+    repair_permutation(cost, &raw, sidelen, &mut checkpoint)
 }
 
 /// PatchMatch propagation/random-search correspondence + sparse auction repair.
@@ -205,13 +235,17 @@ pub fn process_patchmatch<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (cost, source_pixels, _target_pixels) = build_problem(&unprocessed, &settings)?;
     let n = cost.n_dst();
 
     tx.send(ProgressMsg::Progress(0.0));
-    let assignments = solve(&cost, settings.sidelen);
+    let Some(assignments) =
+        solve_with_checkpoint(&cost, settings.sidelen, || !checkpoint(&control, tx))
+    else {
+        return Ok(());
+    };
     if let Err(err) = validate_permutation(&assignments, n) {
         tx.send(ProgressMsg::Error(format!(
             "PatchMatch produced invalid assignment: {err}"
@@ -219,13 +253,6 @@ pub fn process_patchmatch<S: ProgressSink>(
         return Ok(());
     }
     emit_preview(tx, &source_pixels, &assignments, settings.sidelen, 0.95);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if check_cancel(&cancel, tx) {
-            return Ok(());
-        }
-    }
 
     finalize_preset(
         tx,
@@ -288,8 +315,8 @@ mod tests {
         let cost = identical_pixel_lookup(9, 13);
         // More iterations should not increase cost (monotone non-increasing
         // during the search phase, before repair).
-        let raw1 = patchmatch_search(&cost, 3, 1);
-        let raw4 = patchmatch_search(&cost, 3, 4);
+        let raw1 = patchmatch_search(&cost, 3, 1, &mut || true).unwrap();
+        let raw4 = patchmatch_search(&cost, 3, 4, &mut || true).unwrap();
         let cost1: i64 = (0..9).map(|dst| cost.cost(dst, raw1[dst])).sum();
         let cost4: i64 = (0..9).map(|dst| cost.cost(dst, raw4[dst])).sum();
         assert!(
@@ -317,7 +344,7 @@ mod tests {
         let cost = identical_pixel_lookup(4, 13);
         // Raw assignment with collisions: all targets claim source 0.
         let raw = vec![0, 0, 0, 0];
-        let assignments = repair_permutation(&cost, &raw, 2);
+        let assignments = repair_permutation(&cost, &raw, 2, &mut || true).unwrap();
         assert_valid_permutation(&assignments, 4);
     }
 

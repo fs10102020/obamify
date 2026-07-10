@@ -1,5 +1,3 @@
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, atomic::AtomicBool};
 pub mod algorithms;
 pub mod drawing_process;
 pub mod util;
@@ -8,6 +6,7 @@ pub mod util;
 pub mod worker;
 
 use crate::app::calculate::util::Algorithm;
+use crate::app::calculate::util::SolverControl;
 use crate::app::{
     calculate::util::{GenerationSettings, ProgressSink},
     preset::{Preset, UnprocessedPreset},
@@ -90,7 +89,7 @@ pub fn process_optimal<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source_img = image::ImageBuffer::from_vec(
         unprocessed.width,
@@ -231,16 +230,12 @@ pub fn process_optimal<S: ProgressSink>(
                 xy[x] = y;
                 y = prec;
             }
+            if !control.checkpoint() {
+                tx.send(ProgressMsg::Cancelled);
+                return Ok(());
+            }
             if root % 100 == 0 {
                 // send progress
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        tx.send(ProgressMsg::Cancelled);
-                        return Ok(());
-                    }
-                }
-
                 tx.send(ProgressMsg::Progress(root as f32 / nx as f32));
 
                 let data = make_new_img(
@@ -350,7 +345,7 @@ pub fn process_genetic<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source_img = image::ImageBuffer::from_vec(
         unprocessed.width,
@@ -401,7 +396,11 @@ pub fn process_genetic<S: ProgressSink>(
             return Ok(());
         }
         let mut swaps_made = 0;
-        for _ in 0..swaps_per_generation {
+        for swap_index in 0..swaps_per_generation {
+            if swap_index % 4096 == 0 && !control.checkpoint() {
+                tx.send(ProgressMsg::Cancelled);
+                return Ok(());
+            }
             let apos = rng.gen_range(0..pixels.len() as u32) as usize;
             let ax = apos as u16 % settings.sidelen as u16;
             let ay = apos as u16 / settings.sidelen as u16;
@@ -436,25 +435,12 @@ pub fn process_genetic<S: ProgressSink>(
                 pixels[apos].update_heuristic(b_on_a_h);
                 pixels[bpos].update_heuristic(a_on_b_h);
                 swaps_made += 1;
-                if swaps_made % 5000 == 4999 {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                            tx.send(ProgressMsg::Cancelled);
-                            return Ok(());
-                        }
-                    }
-                }
             }
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                println!("cancelled");
-                tx.send(ProgressMsg::Cancelled);
-                return Ok(());
-            }
+        if !control.checkpoint() {
+            tx.send(ProgressMsg::Cancelled);
+            return Ok(());
         }
 
         let assignments = pixels
@@ -498,46 +484,47 @@ pub fn process<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
-    cancel: Arc<AtomicBool>,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use algorithms::*;
     match settings.algorithm {
-        Algorithm::Optimal => process_optimal(unprocessed, settings, tx, cancel),
-        Algorithm::Genetic => process_genetic(unprocessed, settings, tx, cancel),
+        Algorithm::Optimal => process_optimal(unprocessed, settings, tx, control),
+        Algorithm::Genetic => process_genetic(unprocessed, settings, tx, control),
         Algorithm::JonkerVolgenant => {
-            jonker_volgenant::process_jonker_volgenant(unprocessed, settings, tx, cancel)
+            jonker_volgenant::process_jonker_volgenant(unprocessed, settings, tx, control)
         }
-        Algorithm::Auction => auction::process_auction(unprocessed, settings, tx, cancel),
-        Algorithm::Multiscale => multiscale::process_multiscale(unprocessed, settings, tx, cancel),
-        Algorithm::Sinkhorn => sinkhorn::process_sinkhorn(unprocessed, settings, tx, cancel),
-        Algorithm::PatchMatch => patchmatch::process_patchmatch(unprocessed, settings, tx, cancel),
-        Algorithm::Fast => modes::process_fast(unprocessed, settings, tx, cancel),
-        Algorithm::Balanced => modes::process_balanced(unprocessed, settings, tx, cancel),
-        Algorithm::Maximum => modes::process_maximum(unprocessed, settings, tx, cancel),
+        Algorithm::Auction => auction::process_auction(unprocessed, settings, tx, control),
+        Algorithm::Multiscale => multiscale::process_multiscale(unprocessed, settings, tx, control),
+        Algorithm::Sinkhorn => sinkhorn::process_sinkhorn(unprocessed, settings, tx, control),
+        Algorithm::PatchMatch => patchmatch::process_patchmatch(unprocessed, settings, tx, control),
+        Algorithm::Fast => modes::process_fast(unprocessed, settings, tx, control),
+        Algorithm::Balanced => modes::process_balanced(unprocessed, settings, tx, control),
+        Algorithm::Maximum => modes::process_maximum(unprocessed, settings, tx, control),
     }
 }
 
-/// Dispatch to the selected algorithm backend (WASM, no cancel flag).
+/// Dispatch to the selected algorithm backend (WASM).
 #[cfg(target_arch = "wasm32")]
 pub fn process<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
+    control: SolverControl,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use algorithms::*;
     match settings.algorithm {
-        Algorithm::Optimal => process_optimal(unprocessed, settings, tx),
-        Algorithm::Genetic => process_genetic(unprocessed, settings, tx),
+        Algorithm::Optimal => process_optimal(unprocessed, settings, tx, control),
+        Algorithm::Genetic => process_genetic(unprocessed, settings, tx, control),
         Algorithm::JonkerVolgenant => {
-            jonker_volgenant::process_jonker_volgenant(unprocessed, settings, tx)
+            jonker_volgenant::process_jonker_volgenant(unprocessed, settings, tx, control)
         }
-        Algorithm::Auction => auction::process_auction(unprocessed, settings, tx),
-        Algorithm::Multiscale => multiscale::process_multiscale(unprocessed, settings, tx),
-        Algorithm::Sinkhorn => sinkhorn::process_sinkhorn(unprocessed, settings, tx),
-        Algorithm::PatchMatch => patchmatch::process_patchmatch(unprocessed, settings, tx),
-        Algorithm::Fast => modes::process_fast(unprocessed, settings, tx),
-        Algorithm::Balanced => modes::process_balanced(unprocessed, settings, tx),
-        Algorithm::Maximum => modes::process_maximum(unprocessed, settings, tx),
+        Algorithm::Auction => auction::process_auction(unprocessed, settings, tx, control),
+        Algorithm::Multiscale => multiscale::process_multiscale(unprocessed, settings, tx, control),
+        Algorithm::Sinkhorn => sinkhorn::process_sinkhorn(unprocessed, settings, tx, control),
+        Algorithm::PatchMatch => patchmatch::process_patchmatch(unprocessed, settings, tx, control),
+        Algorithm::Fast => modes::process_fast(unprocessed, settings, tx, control),
+        Algorithm::Balanced => modes::process_balanced(unprocessed, settings, tx, control),
+        Algorithm::Maximum => modes::process_maximum(unprocessed, settings, tx, control),
     }
 }
 
@@ -549,7 +536,7 @@ mod tests {
     use uuid::Uuid;
 
     #[cfg(not(target_arch = "wasm32"))]
-    use std::sync::{Arc, atomic::AtomicBool};
+    use crate::app::calculate::util::SolverControl;
 
     // --- Tests 1-3: heuristic function ---
 
@@ -620,13 +607,13 @@ mod tests {
             let (unprocessed, mut settings) = make_test_preset(4, 16);
             settings.algorithm = algorithm;
             settings.proximity_importance = 1;
-            let cancel = Arc::new(AtomicBool::new(false));
+            let control = SolverControl::default();
             let mut msgs: Vec<ProgressMsg> = Vec::new();
             let mut sink = |msg: ProgressMsg| {
                 msgs.push(msg);
             };
 
-            let result = process(unprocessed, settings, &mut sink, cancel);
+            let result = process(unprocessed, settings, &mut sink, control);
             assert!(result.is_ok(), "{} returned an error", algorithm.label());
             assert!(
                 msgs.iter().any(|m| matches!(m, ProgressMsg::Done(_))),
@@ -643,12 +630,12 @@ mod tests {
     fn test_process_optimal_4x4_emits_done_preset() {
         let (unprocessed, mut settings) = make_test_preset(4, 16);
         settings.algorithm = Algorithm::Optimal;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let control = SolverControl::default();
         let mut msgs: Vec<ProgressMsg> = Vec::new();
         let mut sink = |msg: ProgressMsg| {
             msgs.push(msg);
         };
-        let result = process_optimal(unprocessed, settings, &mut sink, cancel);
+        let result = process_optimal(unprocessed, settings, &mut sink, control);
         assert!(result.is_ok(), "process_optimal should succeed");
         let has_done = msgs.iter().any(|m| matches!(m, ProgressMsg::Done(_)));
         assert!(
@@ -665,12 +652,12 @@ mod tests {
         let (unprocessed, mut settings) = make_test_preset(2, 4);
         settings.algorithm = Algorithm::Genetic;
         settings.proximity_importance = 1;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let control = SolverControl::default();
         let mut msgs: Vec<ProgressMsg> = Vec::new();
         let mut sink = |msg: ProgressMsg| {
             msgs.push(msg);
         };
-        let result = process_genetic(unprocessed, settings, &mut sink, cancel);
+        let result = process_genetic(unprocessed, settings, &mut sink, control);
         assert!(result.is_ok());
         let has_done = msgs.iter().any(|m| matches!(m, ProgressMsg::Done(_)));
         assert!(has_done, "genetic should converge and emit Done");
@@ -683,12 +670,12 @@ mod tests {
         let (unprocessed, mut settings) = make_test_preset(4, 16);
         settings.algorithm = Algorithm::Genetic;
         settings.proximity_importance = 1;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let control = SolverControl::default();
         let mut msgs: Vec<ProgressMsg> = Vec::new();
         let mut sink = |msg: ProgressMsg| {
             msgs.push(msg);
         };
-        let result = process_genetic(unprocessed, settings, &mut sink, cancel);
+        let result = process_genetic(unprocessed, settings, &mut sink, control);
         assert!(result.is_ok());
         // Should emit at least one Progress or UpdatePreview message.
         let has_progress = msgs.iter().any(|m| {
