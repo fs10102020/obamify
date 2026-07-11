@@ -100,7 +100,7 @@ This project is intentionally an algorithm showcase. Do not collapse the 10 algo
 ## OpenAI Sites Deployment
 
 - Keep the Rust/WASM implementation. Sites compatibility is handled at the deployment boundary by `sites/worker.mjs` and `scripts/package-sites.sh`.
-- Sites static assets must be under `dist/client/`; the ES-module worker entry point must be `dist/index.js`.
+- Sites static assets must be under `dist/client/`; emit the ES-module worker at `dist/server/index.js` and keep `dist/index.js` for legacy compatibility. Copy the hosting manifest to `dist/.openai/hosting.json`.
 - The worker adds COOP/COEP, origin-agent-cluster, CORP, and nosniff headers. Do not remove these without rechecking WASM Pause/Step on Safari and Chromium.
 - `scripts/package-sites.sh` builds release WASM, omits the README-only `example.gif`, validates the worker and required artifacts, and produces `target/obamify-sites.tar.gz`.
 - Push the exact staged source tree to the Sites-managed `main` branch before saving a version with its commit SHA. Never persist the short-lived repository credential.

@@ -61,7 +61,8 @@ needed by Pause and frame-step controls.
 The command runs a release Trunk build and creates:
 
 - `target/sites-package/`: a Sites-ready source tree with static assets under
-  `dist/client/` and the worker entry point at `dist/index.js`.
+  `dist/client/`, the current worker entry point at `dist/server/index.js`, and
+  a legacy-compatible copy at `dist/index.js`.
 - `target/obamify-sites.tar.gz`: the archive passed to Sites when saving a version.
 
 `example.gif` is intentionally omitted because it is README media rather than a runtime

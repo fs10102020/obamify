@@ -40,11 +40,14 @@ else
 fi
 
 git -C "$repo_root" archive HEAD | tar --exclude="example.gif" -x -C "$stage_dir"
-mkdir -p "$stage_dir/dist/client"
+mkdir -p "$stage_dir/dist/client" "$stage_dir/dist/server" "$stage_dir/dist/.openai"
 cp -R "$trunk_dist/." "$stage_dir/dist/client/"
 cp "$repo_root/sites/worker.mjs" "$stage_dir/dist/index.js"
+cp "$repo_root/sites/worker.mjs" "$stage_dir/dist/server/index.js"
+cp "$repo_root/.openai/hosting.json" "$stage_dir/dist/.openai/hosting.json"
 
 node --check "$stage_dir/dist/index.js"
+node --check "$stage_dir/dist/server/index.js"
 test -f "$stage_dir/dist/client/index.html"
 test -n "$(find "$stage_dir/dist/client" -maxdepth 1 -name '*_bg.wasm' -print -quit)"
 test ! -e "$stage_dir/example.gif"
