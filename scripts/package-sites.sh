@@ -40,6 +40,9 @@ else
 fi
 
 git -C "$repo_root" archive HEAD | tar --exclude="example.gif" -x -C "$stage_dir"
+# The packaged tree is committed to the Sites source repository, so its generated
+# deployment artifacts must not inherit the development checkout's dist ignore.
+sed -i '/^dist$/d' "$stage_dir/.gitignore"
 mkdir -p "$stage_dir/dist/client" "$stage_dir/dist/server" "$stage_dir/dist/.openai"
 cp -R "$trunk_dist/." "$stage_dir/dist/client/"
 cp "$repo_root/sites/worker.mjs" "$stage_dir/dist/index.js"
