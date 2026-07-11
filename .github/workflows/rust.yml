@@ -66,8 +66,10 @@ jobs:
                   targets: wasm32-unknown-unknown
             - name: Download and install Trunk binary
               run: wget -qO- https://github.com/thedodd/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
-            - name: Build
-              run: ./trunk build
+            - name: Test Sites worker
+              run: node --test sites/worker.test.mjs
+            - name: Build and package Sites artifact
+              run: TRUNK_BIN=./trunk ./scripts/package-sites.sh
 
     build:
         runs-on: ${{ matrix.os }}

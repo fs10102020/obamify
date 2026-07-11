@@ -1,4 +1,4 @@
-var CACHE_NAME = "obamify-pwa-v3"
+var CACHE_NAME = "obamify-pwa-v4"
 
 var filesToCache = [
     "./",

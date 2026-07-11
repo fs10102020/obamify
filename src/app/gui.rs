@@ -18,6 +18,7 @@ use eframe::App;
 use eframe::Frame;
 use egui::Color32;
 use egui::Modal;
+use egui::ScrollArea;
 use egui::TextureHandle;
 use egui::Window;
 use image::buffer::ConvertBuffer;
@@ -273,7 +274,8 @@ impl App for ObamifyApp {
         // );
 
         let screen_width = ctx.available_rect().width();
-        let is_landscape = screen_width > ctx.available_rect().height();
+        let screen_height = ctx.available_rect().height();
+        let is_landscape = screen_width > screen_height;
         let mobile_layout = screen_width < 750.0;
 
         let baseline_zoom = if is_landscape { 1.4_f32 } else { 1.0_f32 };
@@ -529,12 +531,15 @@ impl App for ObamifyApp {
                                             (200.0 + pulse * 55.0) as u8,
                                         );
 
-                                        let button = egui::Button::new("New image")
+                                        let button = egui::Button::new("Create / solve")
                                             .stroke(egui::Stroke::new(1.0, glow_color));
                                         ui.add(button)
                                     } else {
-                                        ui.button("New image")
-                                    };
+                                        ui.button("Create / solve")
+                                    }
+                                    .on_hover_text(
+                                        "Choose an image, solver algorithm, and output settings",
+                                    );
 
                                     if button_response.clicked() {
                                         // open file select
@@ -577,22 +582,36 @@ impl App for ObamifyApp {
             } else {
                 screen_width.min(900.0) * 0.9
             };
-            Window::new("Create preset")
+            let settings_height = (screen_height * 0.86).max(360.0);
+            Window::new("Create / solve")
                 .max_width(settings_width)
-                //.max_height(500.0)
+                .max_height(settings_height)
                 .resizable(false)
                 .collapsible(false)
                 .movable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    //ctx.set_zoom_factor((screen_width / 400.0).max(1.0) * baseline_zoom);
-                    // ui.set_width((screen_width * 0.9).min(400.0));
-                    // ui.set_max_height(500.0);
                     let max_w = ui.available_width();
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(max_w, 0.0),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
+                    ui.set_max_height(settings_height);
+                    ScrollArea::vertical()
+                        .id_salt("create_solve_settings")
+                        .max_height(settings_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if mobile_layout {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Adjust images, choose a solver, then scroll to Start.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(4.0);
+                            }
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(max_w, 0.0),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
                             ui.set_max_width(max_w);
                             // ui.add(egui::Label::new(
                             //     egui::RichText::new("obamification settings")
@@ -797,8 +816,9 @@ impl App for ObamifyApp {
                                     show_icons();
                                 }
                             });
-                        },
-                    );
+                                },
+                            );
+                        });
                 });
         }
 
@@ -889,7 +909,10 @@ impl App for ObamifyApp {
                         }
                         ui.add(egui::ProgressBar::new(self.gui.last_progress).show_percentage());
 
-                        ui.horizontal(|ui| {
+                        if self.gui.solver_control.is_some() {
+                            ui.label(egui::RichText::new("Solver controls").strong().small());
+                        }
+                        ui.horizontal_wrapped(|ui| {
                             if let Some(control) = &self.gui.solver_control {
                                 let paused = control.is_paused();
                                 let available = {
@@ -924,7 +947,9 @@ impl App for ObamifyApp {
                                 ui.label(format!("frame {}", control.frame()));
                                 #[cfg(target_arch = "wasm32")]
                                 if !available {
-                                    ui.label("pause requires shared memory");
+                                    ui.label(
+                                        "Pause/Step unavailable: shared memory is not enabled.",
+                                    );
                                 }
                             }
                             if ui.button("cancel").clicked() {

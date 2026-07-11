@@ -13,6 +13,8 @@ cargo test --lib
 cargo clippy --all-targets -- -D warnings
 cargo check --all-features --lib --target wasm32-unknown-unknown
 RUSTFLAGS='-D warnings' trunk build
+node --test sites/worker.test.mjs
+./scripts/package-sites.sh
 ```
 
 Focused test: `cargo test --lib test_name`. Native run: `cargo run --release`. Web run: `trunk serve --release --open`.
@@ -52,11 +54,13 @@ This project is intentionally an algorithm showcase. Do not collapse the 10 algo
 - When leaving Draw mode, `current_drawing_id` is incremented so the native thread self-cancels. `UpdateAssignments` messages are filtered outside Draw mode.
 - `PixelData.last_edited` was removed — no `frame_count` in drawing process. `max_dist` uses `DRAWING_CANVAS_SIZE / 4`.
 
-## Native Job Cancellation
+## Solver Job Control
 
-- `GuiState.process_cancelled` is `Option<Arc<AtomicBool>>`. Create a fresh token per job and set `process_cancelled` to `None` when the progress modal hides.
-- Old cancelled jobs hold their own `Arc` clone; starting a new job never resets a prior job's token.
-- The `ProgressMsg` modal is keyed by a UUID from `GenerationSettings.id` — this distinguishes concurrent job windows even without explicit job-ID filtering on messages.
+- `GuiState.solver_control` is `Option<SolverControl>`. Create a fresh handle per job and clear it when the progress modal hides.
+- Every solver checkpoints through `SolverControl`; cancellation, pause/resume, frame-step, and the displayed frame counter share that path.
+- Native control uses an atomic cancel flag plus a condition variable. WASM uses `SharedArrayBuffer`/`Atomics`; the UI disables Pause/Step when shared memory is unavailable.
+- Native drawing and generation use separate progress channels so a stale drawing cancellation cannot cancel a new generation job.
+- The `ProgressMsg` modal is keyed by the UUID from `GenerationSettings.id`.
 
 ## Genetic Solver
 
@@ -66,6 +70,8 @@ This project is intentionally an algorithm showcase. Do not collapse the 10 algo
 ## WASM Worker
 
 - Worker creation, serialization, and `postMessage` all use fallible paths — failures push `ProgressMsg::Error` to the inbox instead of panicking.
+- Generation requests send an envelope containing the serialized request and the shared `SolverControl` buffer.
+- Drawing mode stays on the animation loop with a bounded per-frame optimizer budget; generation algorithms run in the dedicated worker.
 
 ## Preset Persistence
 
@@ -79,7 +85,7 @@ This project is intentionally an algorithm showcase. Do not collapse the 10 algo
 
 ## Tests And Lints
 
-- Tests under `#[cfg(test)] mod tests`; no `tests/` directory. **116 active lib tests, 0 ignored.**
+- Tests under `#[cfg(test)] mod tests`; no `tests/` directory. **118 active lib tests, 0 ignored.**
 - `unsafe_code = "deny"`, `redundant_clone = "deny"`. CI sets `RUSTFLAGS=-D warnings`; `missing_docs = "warn"` becomes an error — new public items need docs.
 - Heuristic solver tests check valid permutations and cost bounds, not exact optimality. Exact solvers have brute-force oracle tests for tiny cases.
 - Use `let _ =` not `.ok()` for must-use returns.
@@ -87,9 +93,17 @@ This project is intentionally an algorithm showcase. Do not collapse the 10 algo
 ## Web/PWA Files
 
 - `index.html` registers `sw.js`; `#dev` skips service-worker registration during cache debugging.
-- `assets/sw.js` (v2): network-first for navigations so users always get fresh HTML; cache-first for other same-origin GETs. Install precaches shell files and fails if precaching is broken. Activate deletes only old `obamify-pwa-*` caches.
+- `assets/sw.js` (v4): network-first for navigations so users always get fresh HTML; cache-first for other same-origin GETs. It also preserves the shared-memory isolation fallback for hosts that cannot set response headers directly.
 - `assets/manifest.json`: relative paths throughout (`assets/...`, `./index.html`, `./`) for subpath deploy compatibility.
 - `Trunk.toml` enables file hashing; use Trunk for web builds.
+
+## OpenAI Sites Deployment
+
+- Keep the Rust/WASM implementation. Sites compatibility is handled at the deployment boundary by `sites/worker.mjs` and `scripts/package-sites.sh`.
+- Sites static assets must be under `dist/client/`; the ES-module worker entry point must be `dist/index.js`.
+- The worker adds COOP/COEP, origin-agent-cluster, CORP, and nosniff headers. Do not remove these without rechecking WASM Pause/Step on Safari and Chromium.
+- `scripts/package-sites.sh` builds release WASM, omits the README-only `example.gif`, validates the worker and required artifacts, and produces `target/obamify-sites.tar.gz`.
+- Push the exact staged source tree to the Sites-managed `main` branch before saving a version with its commit SHA. Never persist the short-lived repository credential.
 
 ## Removed Dependencies
 

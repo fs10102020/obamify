@@ -48,6 +48,29 @@ Run 'xattr -C <path/to/app.app>' in your terminal to remove the damaged app warn
 3. Install Trunk with `cargo install --locked trunk`
 4. Run `trunk serve --release --open`
 
+#### Packaging for OpenAI Sites
+
+The Sites deployment keeps the Rust algorithms and compiles the app to WASM. A small
+JavaScript worker serves the Trunk output and adds the cross-origin isolation headers
+needed by Pause and frame-step controls.
+
+```bash
+./scripts/package-sites.sh
+```
+
+The command runs a release Trunk build and creates:
+
+- `target/sites-package/`: a Sites-ready source tree with static assets under
+  `dist/client/` and the worker entry point at `dist/index.js`.
+- `target/obamify-sites.tar.gz`: the archive passed to Sites when saving a version.
+
+`example.gif` is intentionally omitted because it is README media rather than a runtime
+asset. Set `TRUNK_BIN=/path/to/trunk` when Trunk is not on `PATH`. For a previously built
+root `dist/`, use `SITES_SKIP_BUILD=1 ./scripts/package-sites.sh`.
+
+The Sites-managed source branch must point at the same staged tree used to create the
+archive before saving a version. Never commit or persist the short-lived Sites Git token.
+
 # Contributing
 
 Please open an issue or a pull request if you have any suggestions or find any bugs :)
